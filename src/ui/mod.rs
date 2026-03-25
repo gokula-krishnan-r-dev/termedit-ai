@@ -1,6 +1,9 @@
+pub mod ai_panel;
 pub mod command_palette;
 pub mod editor_pane;
 pub mod file_tree;
 pub mod modal;
+pub mod open_tabs_palette;
+pub mod outline_palette;
 pub mod status_bar;
 pub mod tab_bar;

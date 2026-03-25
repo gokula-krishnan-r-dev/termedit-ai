@@ -27,6 +27,10 @@ pub struct Settings {
     pub ai_debounce_ms: u64,
     /// Optional AI model override (e.g. faster/smaller); None = default.
     pub ai_model: Option<String>,
+    /// Gemini model id for the AI assistant panel (`GEMINI_CHAT_MODELS`); None = first listed.
+    pub ai_chat_model: Option<String>,
+    /// Optional Gemini API key; env `GEMINI_API_KEY` is preferred when set.
+    pub gemini_api_key: Option<String>,
     /// Enable auto-save (in seconds, 0 = disabled).
     pub auto_save: u64,
     /// Show whitespace characters.
@@ -39,8 +43,10 @@ pub struct Settings {
     pub scroll_padding: usize,
     /// Font size (for terminal reference).
     pub font_size: u16,
-    /// Enable bracket matching highlight.
+    /// Enable bracket matching highlight (paired `()`, `[]`, `{}`).
     pub bracket_matching: bool,
+    /// Max character count to scan for bracket matching; larger buffers skip highlight and jump.
+    pub bracket_match_max_chars: usize,
     /// Enable auto-indent.
     pub auto_indent: bool,
     /// Maximum line length hint (ruler).
@@ -49,6 +55,24 @@ pub struct Settings {
     pub minimap: bool,
     /// Restore previous session (open files, cursor, scroll) on startup when no files given.
     pub session_restore: bool,
+    /// Enable Go to Symbol (outline) / Ctrl+Shift+O.
+    pub outline_enabled: bool,
+    /// Max UTF-8 bytes to parse for outline; larger buffers skip parsing.
+    pub outline_max_bytes: usize,
+    /// Enable Find in Open Tabs (Ctrl/Cmd+Shift+F).
+    pub find_in_open_tabs_enabled: bool,
+    /// Max result rows to collect across all open tabs.
+    pub find_in_open_tabs_max_results: usize,
+    /// Skip tabs whose character length exceeds this (no search in that buffer).
+    pub find_in_open_tabs_max_chars_per_tab: usize,
+    /// Debounce before re-running search after query changes (ms).
+    pub find_in_open_tabs_debounce_ms: u64,
+    /// Case-sensitive search in Find in Open Tabs.
+    pub find_in_open_tabs_case_sensitive: bool,
+    /// Whole-word only in Find in Open Tabs.
+    pub find_in_open_tabs_whole_word: bool,
+    /// Use regex in Find in Open Tabs (otherwise literal).
+    pub find_in_open_tabs_regex: bool,
 }
 
 impl Default for Settings {
@@ -63,6 +87,8 @@ impl Default for Settings {
             ai_enabled: true,
             ai_debounce_ms: 200,
             ai_model: None,
+            ai_chat_model: None,
+            gemini_api_key: None,
             auto_save: 0,
             show_whitespace: false,
             smooth_scroll: true,
@@ -70,10 +96,20 @@ impl Default for Settings {
             scroll_padding: 5,
             font_size: 14,
             bracket_matching: true,
+            bracket_match_max_chars: 2_000_000,
             auto_indent: true,
             ruler: None,
             minimap: false,
             session_restore: true,
+            outline_enabled: true,
+            outline_max_bytes: 2_000_000,
+            find_in_open_tabs_enabled: true,
+            find_in_open_tabs_max_results: 500,
+            find_in_open_tabs_max_chars_per_tab: 2_000_000,
+            find_in_open_tabs_debounce_ms: 250,
+            find_in_open_tabs_case_sensitive: false,
+            find_in_open_tabs_whole_word: false,
+            find_in_open_tabs_regex: false,
         }
     }
 }
@@ -100,7 +136,14 @@ impl Settings {
     }
 
     /// Merge CLI overrides into settings.
-    pub fn merge_cli(&mut self, theme: Option<&str>, no_ai: bool, no_restore: bool) {
+    pub fn merge_cli(
+        &mut self,
+        theme: Option<&str>,
+        no_ai: bool,
+        no_restore: bool,
+        ai_chat_model: Option<&str>,
+        gemini_api_key: Option<&str>,
+    ) {
         if let Some(theme_name) = theme {
             self.theme = theme_name.to_string();
         }
@@ -109,6 +152,12 @@ impl Settings {
         }
         if no_restore {
             self.session_restore = false;
+        }
+        if let Some(m) = ai_chat_model.map(str::trim).filter(|s| !s.is_empty()) {
+            self.ai_chat_model = Some(m.to_string());
+        }
+        if let Some(k) = gemini_api_key.map(str::trim).filter(|s| !s.is_empty()) {
+            self.gemini_api_key = Some(k.to_string());
         }
     }
 }
@@ -126,6 +175,11 @@ mod tests {
         assert!(s.mouse);
         assert_eq!(s.theme, "dark-plus");
         assert!(s.session_restore);
+        assert!(s.outline_enabled);
+        assert_eq!(s.outline_max_bytes, 2_000_000);
+        assert_eq!(s.bracket_match_max_chars, 2_000_000);
+        assert!(s.find_in_open_tabs_enabled);
+        assert_eq!(s.find_in_open_tabs_max_results, 500);
     }
 
     #[test]
@@ -146,11 +200,14 @@ theme = "catppuccin-mocha"
     #[test]
     fn test_merge_cli() {
         let mut s = Settings::default();
-        s.merge_cli(Some("tokyo-night"), true, false);
+        s.merge_cli(Some("tokyo-night"), true, false, None, None);
         assert_eq!(s.theme, "tokyo-night");
         assert!(!s.ai_enabled);
         assert!(s.session_restore);
-        s.merge_cli(None, false, true);
+        s.merge_cli(None, false, true, None, None);
         assert!(!s.session_restore);
+        let mut t = Settings::default();
+        t.merge_cli(None, false, false, Some("gemini-1.5-pro"), None);
+        assert_eq!(t.ai_chat_model.as_deref(), Some("gemini-1.5-pro"));
     }
 }

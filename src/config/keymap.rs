@@ -19,6 +19,9 @@ pub enum Action {
     PageUp,
     PageDown,
     GoToLine,
+    GoToSymbol,
+    /// Jump between `()`, `[]`, `{}` (VS Code: Ctrl/Cmd+Shift+\).
+    GoToMatchingBracket,
 
     // === Selection ===
     SelectLeft,
@@ -63,6 +66,8 @@ pub enum Action {
     // === Search ===
     Find,
     FindReplace,
+    /// Search across all open tabs (Ctrl/Cmd+Shift+F).
+    FindInOpenTabs,
     FindNext,
     FindPrev,
     EscapeSearch,
@@ -70,6 +75,10 @@ pub enum Action {
     // === View ===
     ToggleFileTree,
     ToggleAiPanel,
+    /// Insert the last AI assistant reply at the cursor (panel focused).
+    AiInsertLastReply,
+    /// Open the AI assistant with a brainstorm-ideas prompt prefilled.
+    AiBrainstorm,
     CommandPalette,
 
     // === Tabs ===
@@ -153,14 +162,19 @@ pub fn map_key_event(event: KeyEvent) -> Action {
         KeyCode::Char('l') if ctrl || super_ => Action::SelectLine,
         KeyCode::Char('d') if (ctrl || super_) && shift => Action::DuplicateLine,
         KeyCode::Char('d') if ctrl || super_ => Action::DeleteLine,
+        KeyCode::Char('f') if (ctrl || super_) && shift => Action::FindInOpenTabs,
         KeyCode::Char('f') if ctrl || super_ => Action::Find,
         KeyCode::Char('h') if ctrl || super_ => Action::FindReplace,
         KeyCode::Char('g') if ctrl || super_ => Action::GoToLine,
+        KeyCode::Char('o') if (ctrl || super_) && shift => Action::GoToSymbol,
+        KeyCode::Char('\\') if (ctrl || super_) && shift => Action::GoToMatchingBracket,
         KeyCode::Char('n') if ctrl || super_ => Action::NewFile,
         KeyCode::Char('o') if ctrl || super_ => Action::OpenFile,
         KeyCode::Char('w') if ctrl || super_ => Action::CloseBuffer,
         KeyCode::Char('b') if ctrl || super_ => Action::ToggleFileTree,
         KeyCode::Char('k') if ctrl || super_ => Action::ToggleAiPanel,
+        KeyCode::Char('i') if (ctrl || super_) && shift => Action::AiInsertLastReply,
+        KeyCode::Char('u') if (ctrl || super_) && shift => Action::AiBrainstorm,
         KeyCode::Char('p') if ctrl || super_ => Action::CommandPalette,
         KeyCode::Char('/') if ctrl || super_ => Action::ToggleComment,
         KeyCode::Tab if ctrl && shift => Action::PrevTab,
@@ -267,6 +281,71 @@ mod tests {
         assert_eq!(
             map_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER)),
             Action::Undo
+        );
+    }
+
+    #[test]
+    fn test_ctrl_shift_backslash_matching_bracket() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('\\'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Action::GoToMatchingBracket
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('\\'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            )),
+            Action::GoToMatchingBracket
+        );
+    }
+
+    #[test]
+    fn test_ctrl_shift_o_goto_symbol() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Action::GoToSymbol
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('o'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            )),
+            Action::GoToSymbol
+        );
+    }
+
+    #[test]
+    fn test_ctrl_shift_u_ai_brainstorm() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Action::AiBrainstorm
+        );
+    }
+
+    #[test]
+    fn test_ctrl_shift_f_find_in_open_tabs() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )),
+            Action::FindInOpenTabs
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::SUPER | KeyModifiers::SHIFT
+            )),
+            Action::FindInOpenTabs
         );
     }
 }

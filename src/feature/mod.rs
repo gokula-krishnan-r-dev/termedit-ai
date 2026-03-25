@@ -1,6 +1,10 @@
 pub mod ai_completion;
+pub mod brackets;
+pub mod gemini_chat;
+pub mod git_worktree;
 pub mod completion;
 pub mod language;
+pub mod outline;
 pub mod search;
 pub mod session;
 pub mod syntax;

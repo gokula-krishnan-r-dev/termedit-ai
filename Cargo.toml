@@ -1,6 +1,6 @@
 [package]
 name = "termedit"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A modern, nano-style terminal editor with session restore, AI ghost text, and professional shortcuts"
 license = "MIT"

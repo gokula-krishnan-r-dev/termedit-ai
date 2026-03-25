@@ -28,6 +28,8 @@ pub struct EditorPane<'a> {
     completion_dropdown: Option<(&'a [String], usize)>,
     /// When true, reserve the rightmost column for search match tick marks.
     show_match_strip: bool,
+    /// Absolute character indices of the bracket pair highlighting the cursor (if any).
+    bracket_highlight: Option<(usize, usize)>,
 }
 
 impl<'a> EditorPane<'a> {
@@ -51,7 +53,14 @@ impl<'a> EditorPane<'a> {
             ghost_text: None,
             completion_dropdown: None,
             show_match_strip: false,
+            bracket_highlight: None,
         }
+    }
+
+    /// Highlight the bracket pair under the cursor (`()`, `[]`, `{}`).
+    pub fn bracket_highlight(mut self, pair: Option<(usize, usize)>) -> Self {
+        self.bracket_highlight = pair;
+        self
     }
 
     /// Show a one-column overview of match lines on the right edge.
@@ -127,6 +136,9 @@ impl<'a> EditorPane<'a> {
         }
 
         let line_char_start = self.doc.buffer.line_to_char(line_idx);
+        let in_sel = |ac: usize| {
+            selection_range.map_or(false, |(s, e)| ac >= s && ac < e)
+        };
 
         let mut i = visible_start;
         while i < visible_end {
@@ -139,9 +151,14 @@ impl<'a> EditorPane<'a> {
             };
 
             // Check if in selection
-            if let Some((sel_start, sel_end)) = selection_range {
-                if abs_char >= sel_start && abs_char < sel_end {
-                    bg = self.theme.editor.selection_bg;
+            if in_sel(abs_char) {
+                bg = self.theme.editor.selection_bg;
+            }
+
+            // Bracket pair (skip when inside selection; before search)
+            if let Some((a, b)) = self.bracket_highlight {
+                if !in_sel(abs_char) && (abs_char == a || abs_char == b) {
+                    bg = self.theme.ui.bracket_match_bg;
                 }
             }
 
@@ -167,9 +184,13 @@ impl<'a> EditorPane<'a> {
                     self.theme.editor.background
                 };
 
-                if let Some((sel_start, sel_end)) = selection_range {
-                    if next_abs >= sel_start && next_abs < sel_end {
-                        next_bg = self.theme.editor.selection_bg;
+                if in_sel(next_abs) {
+                    next_bg = self.theme.editor.selection_bg;
+                }
+
+                if let Some((ba, bb)) = self.bracket_highlight {
+                    if !in_sel(next_abs) && (next_abs == ba || next_abs == bb) {
+                        next_bg = self.theme.ui.bracket_match_bg;
                     }
                 }
 

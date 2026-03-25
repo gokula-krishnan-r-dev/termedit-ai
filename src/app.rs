@@ -29,11 +29,17 @@ use crate::core::cursor::SelectionMode;
 use crate::core::document::Document;
 use crate::feature::ai_completion::{self, AiContext};
 use crate::feature::completion;
-use crate::feature::search::Search;
+use crate::feature::gemini_chat::{
+    self, resolve_chat_model_id, spawn_gemini_worker, ChatRole, GeminiChatRequest, GeminiTurn,
+};
+use crate::feature::search::{search_open_tabs, Search, SearchConfig};
 use crate::feature::session::{self, SessionState};
 use crate::feature::syntax::SyntaxHighlighter;
+use crate::ui::ai_panel::{AiPanelState, AiPanelWidget};
 use crate::ui::command_palette::{CommandPaletteState, CommandPaletteWidget};
 use crate::ui::editor_pane::EditorPane;
+use crate::ui::open_tabs_palette::{OpenTabsPaletteState, OpenTabsPaletteWidget};
+use crate::ui::outline_palette::{OutlinePaletteState, OutlinePaletteWidget};
 use crate::ui::file_tree::FileTree;
 use crate::ui::modal::{
     find_replace_backtab, find_replace_tab, search_config_from_modal, FindBarFocus, FindReplaceFocus,
@@ -74,6 +80,12 @@ pub struct App {
     path_prompt_after_save: Option<PathAfterSave>,
     /// Ctrl+P command palette.
     command_palette: CommandPaletteState,
+    /// Ctrl/Cmd+Shift+O symbol outline.
+    outline_palette: OutlinePaletteState,
+    /// Ctrl/Cmd+Shift+F search across open tabs.
+    open_tabs_palette: OpenTabsPaletteState,
+    /// Debounce deadline for Find in Open Tabs query scans.
+    open_tabs_debounce_at: Option<Instant>,
     /// Reused buffer when building AI context (reduces allocations).
     ai_context_before: String,
     /// Editor settings.
@@ -117,6 +129,13 @@ pub struct App {
     find_debounce_at: Option<Instant>,
     /// Pending regex [`SearchConfig`] after debounce.
     find_pending_config: Option<crate::feature::search::SearchConfig>,
+    /// Pair of absolute char indices for bracket highlight (`()`, `[]`, `{}`), or None.
+    bracket_highlight: Option<(usize, usize)>,
+    /// Gemini chat overlay (Ctrl/Cmd+K).
+    ai_panel: AiPanelState,
+    gemini_rx: mpsc::Receiver<(u64, Result<String, gemini_chat::GeminiError>)>,
+    gemini_request_tx: mpsc::Sender<(u64, GeminiChatRequest)>,
+    gemini_generation: u64,
 }
 
 /// State for the completion dropdown (keyword/buffer suggestions).
@@ -137,6 +156,11 @@ impl App {
         let debounce_ms = settings.ai_debounce_ms;
         ai_completion::spawn_ai_worker(ai_request_rx, ai_tx.clone(), debounce_ms);
 
+        let chat_model_id = resolve_chat_model_id(settings.ai_chat_model.as_deref());
+        let (gemini_tx, gemini_rx) = mpsc::channel();
+        let (gemini_request_tx, gemini_request_rx) = mpsc::channel();
+        spawn_gemini_worker(gemini_request_rx, gemini_tx);
+
         Self {
             documents: vec![doc],
             active_tab: 0,
@@ -146,6 +170,9 @@ impl App {
             save_confirm_pending: None,
             path_prompt_after_save: None,
             command_palette: CommandPaletteState::new(),
+            outline_palette: OutlinePaletteState::new(),
+            open_tabs_palette: OpenTabsPaletteState::new(),
+            open_tabs_debounce_at: None,
             ai_context_before: String::new(),
             settings,
             theme,
@@ -168,7 +195,273 @@ impl App {
             find_bar_anim_frames: 0,
             find_debounce_at: None,
             find_pending_config: None,
+            bracket_highlight: None,
+            ai_panel: AiPanelState::new(chat_model_id),
+            gemini_rx,
+            gemini_request_tx,
+            gemini_generation: 0,
         }
+    }
+
+    fn sync_ai_chat_model_setting(&mut self) {
+        self.settings.ai_chat_model = Some(self.ai_panel.model_id.clone());
+    }
+
+    fn editor_width_cells(&self) -> u16 {
+        let w = self.viewport_width as u16;
+        if self.show_file_tree {
+            w.saturating_sub(FileTree::width())
+        } else {
+            w
+        }
+    }
+
+    fn resolve_gemini_api_key(&self) -> Option<String> {
+        std::env::var("GEMINI_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.settings
+                    .gemini_api_key
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+            })
+    }
+
+    fn ai_panel_transcript_visible_rows(&self) -> usize {
+        let editor_h = self.viewport_height as u16;
+        let h = editor_h.saturating_sub(2).min(26).max(10);
+        let footer_h = 2u16;
+        h.saturating_sub(3 + footer_h) as usize
+    }
+
+    fn submit_ai_panel_message(&mut self) {
+        let raw = std::mem::take(&mut self.ai_panel.input);
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let text = trimmed.to_string();
+
+        let Some(api_key) = self.resolve_gemini_api_key() else {
+            self.ai_panel.error = Some(
+                "Set GEMINI_API_KEY (env) or gemini_api_key in config.toml.".to_string(),
+            );
+            self.dirty = true;
+            return;
+        };
+
+        self.gemini_generation = self.gemini_generation.wrapping_add(1);
+        let id = self.gemini_generation;
+        self.ai_panel.pending_req_id = Some(id);
+        self.ai_panel.loading = true;
+        self.ai_panel.error = None;
+        self.ai_panel.send_pulse = 3;
+        self.ai_panel.stick_transcript_to_bottom = true;
+
+        let tab = self.active_tab;
+        let doc = &self.documents[tab];
+        let file_label = doc.display_name();
+        let lang = doc.language.clone();
+        let system_instruction = gemini_chat::default_system_instruction(&file_label, &lang);
+
+        self.ai_panel.turns.push(GeminiTurn {
+            role: ChatRole::User,
+            text,
+        });
+
+        let req = GeminiChatRequest {
+            api_key,
+            model_id: self.ai_panel.current_model_id().to_string(),
+            system_instruction,
+            turns: self.ai_panel.turns.clone(),
+        };
+        let _ = self.gemini_request_tx.send((id, req));
+        self.dirty = true;
+    }
+
+    fn insert_last_ai_reply_at_cursor(&mut self) {
+        let Some(text) = self.ai_panel.last_model_reply().map(str::to_string) else {
+            self.status_message = Some("No AI reply to insert.".to_string());
+            return;
+        };
+        let tab = self.active_tab;
+        let doc = &mut self.documents[tab];
+        if doc.cursor.selection.is_some() {
+            let _ = doc.delete_selection();
+        }
+        doc.insert_text(&text);
+        self.sync_bracket_highlight();
+        self.dirty = true;
+    }
+
+    fn handle_ai_panel_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let super_ = key.modifiers.contains(KeyModifiers::SUPER);
+
+        if matches!(key.code, KeyCode::Char('i')) && shift && (ctrl || super_) {
+            self.insert_last_ai_reply_at_cursor();
+            return;
+        }
+        if matches!(key.code, KeyCode::Char('k')) && (ctrl || super_) {
+            self.sync_ai_chat_model_setting();
+            self.ai_panel.close();
+            self.dirty = true;
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.sync_ai_chat_model_setting();
+                self.ai_panel.close();
+                self.dirty = true;
+            }
+            KeyCode::Enter if !shift => {
+                if !self.ai_panel.loading {
+                    self.submit_ai_panel_message();
+                }
+            }
+            KeyCode::Enter => {
+                self.ai_panel.input.push('\n');
+                self.dirty = true;
+            }
+            KeyCode::Tab => {
+                self.ai_panel.cycle_model(1);
+                self.sync_ai_chat_model_setting();
+                self.dirty = true;
+            }
+            KeyCode::Char('m') if ctrl || super_ => {
+                self.ai_panel.cycle_model(1);
+                self.sync_ai_chat_model_setting();
+                self.dirty = true;
+            }
+            KeyCode::PageUp => {
+                let inner = AiPanelState::inner_width_from_editor(self.editor_width_cells());
+                let vis = self.ai_panel_transcript_visible_rows().max(1);
+                let lines = self.ai_panel.build_transcript_lines(inner);
+                let max_scroll = lines.len().saturating_sub(vis);
+                self.ai_panel.stick_transcript_to_bottom = false;
+                self.ai_panel.transcript_scroll = self
+                    .ai_panel
+                    .transcript_scroll
+                    .saturating_sub(vis)
+                    .min(max_scroll);
+                self.dirty = true;
+            }
+            KeyCode::PageDown => {
+                let inner = AiPanelState::inner_width_from_editor(self.editor_width_cells());
+                let vis = self.ai_panel_transcript_visible_rows().max(1);
+                let lines = self.ai_panel.build_transcript_lines(inner);
+                let max_scroll = lines.len().saturating_sub(vis);
+                self.ai_panel.stick_transcript_to_bottom = false;
+                self.ai_panel.transcript_scroll = (self.ai_panel.transcript_scroll + vis).min(max_scroll);
+                if self.ai_panel.transcript_scroll >= max_scroll {
+                    self.ai_panel.stick_transcript_to_bottom = true;
+                }
+                self.dirty = true;
+            }
+            KeyCode::Up => {
+                let inner = AiPanelState::inner_width_from_editor(self.editor_width_cells());
+                let vis = self.ai_panel_transcript_visible_rows().max(1);
+                let lines = self.ai_panel.build_transcript_lines(inner);
+                let max_scroll = lines.len().saturating_sub(vis);
+                self.ai_panel.stick_transcript_to_bottom = false;
+                self.ai_panel.transcript_scroll = self
+                    .ai_panel
+                    .transcript_scroll
+                    .saturating_sub(1)
+                    .min(max_scroll);
+                self.dirty = true;
+            }
+            KeyCode::Down => {
+                let inner = AiPanelState::inner_width_from_editor(self.editor_width_cells());
+                let vis = self.ai_panel_transcript_visible_rows().max(1);
+                let lines = self.ai_panel.build_transcript_lines(inner);
+                let max_scroll = lines.len().saturating_sub(vis);
+                self.ai_panel.stick_transcript_to_bottom = false;
+                self.ai_panel.transcript_scroll = (self.ai_panel.transcript_scroll + 1).min(max_scroll);
+                if self.ai_panel.transcript_scroll >= max_scroll {
+                    self.ai_panel.stick_transcript_to_bottom = true;
+                }
+                self.dirty = true;
+            }
+            KeyCode::Backspace => {
+                self.ai_panel.input.pop();
+                self.dirty = true;
+            }
+            KeyCode::Char(c) if !ctrl && !super_ => {
+                self.ai_panel.input.push(c);
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_bracket_highlight(&mut self) {
+        self.bracket_highlight = None;
+        if !self.settings.bracket_matching {
+            return;
+        }
+        let doc = &self.documents[self.active_tab];
+        let max_c = self.settings.bracket_match_max_chars;
+        if doc.buffer.len_chars() > max_c {
+            return;
+        }
+        self.bracket_highlight = crate::feature::brackets::matching_bracket_pair_at_cursor(
+            &doc.buffer,
+            doc.cursor.line,
+            doc.cursor.col,
+            max_c,
+        );
+    }
+
+    fn go_to_matching_bracket_action(&mut self) {
+        let tab = self.active_tab;
+        let max_c = self.settings.bracket_match_max_chars;
+        let vh = self.viewport_height;
+        let vw = self.viewport_width;
+
+        let goto = {
+            let doc = &self.documents[tab];
+            if doc.buffer.len_chars() > max_c {
+                self.status_message = Some(format!(
+                    "Bracket match skipped: buffer longer than bracket_match_max_chars ({}).",
+                    max_c
+                ));
+                None
+            } else if let Some(bi) = crate::feature::brackets::resolve_bracket_index(
+                &doc.buffer,
+                doc.cursor.line,
+                doc.cursor.col,
+            ) {
+                if let Some((lo, hi)) = crate::feature::brackets::matching_pair(&doc.buffer, bi) {
+                    let target = if bi == lo { hi } else { lo };
+                    let line = doc.buffer.char_to_line(target);
+                    let line_start = doc.buffer.line_to_char(line);
+                    let col = target - line_start;
+                    Some((line, col))
+                } else {
+                    self.status_message = Some("No matching bracket.".to_string());
+                    None
+                }
+            } else {
+                self.status_message = Some("No bracket at cursor.".to_string());
+                None
+            }
+        };
+
+        if let Some((line, col)) = goto {
+            let doc = &mut self.documents[tab];
+            doc.cursor.goto(line, col, &doc.buffer);
+            doc.ensure_cursor_visible(vh, vw);
+        }
+
+        self.ghost_suggestion = None;
+        self.ghost_trigger_pos = None;
+        self.ai_pending = false;
+        self.completion_list = None;
     }
 
     /// Build session state from current documents (for saving on exit).
@@ -219,6 +512,20 @@ impl App {
     }
 
     /// Open a file and add it as a new tab.
+    /// Remove the initial empty document when at least one CLI file tab exists.
+    pub fn drop_cli_placeholder_tab_if_redundant(&mut self) {
+        if self.documents.len() <= 1 {
+            return;
+        }
+        let d = &self.documents[0];
+        if d.buffer.file_path.is_none()
+            && !d.is_modified()
+            && d.buffer.rope.len_chars() == 0
+        {
+            self.remove_tab_at(0);
+        }
+    }
+
     pub fn open_file(&mut self, path: &Path) -> Result<()> {
         // Check if already open
         for (i, doc) in self.documents.iter().enumerate() {
@@ -374,6 +681,209 @@ impl App {
         }
     }
 
+    fn open_find_in_open_tabs_palette(&mut self) {
+        self.command_palette.close();
+        self.outline_palette.close();
+        self.ai_panel.close();
+        self.open_tabs_palette.open();
+        self.open_tabs_debounce_at = None;
+    }
+
+    fn schedule_open_tabs_search_debounce(&mut self) {
+        let ms = self.settings.find_in_open_tabs_debounce_ms.max(1);
+        self.open_tabs_debounce_at = Some(Instant::now() + Duration::from_millis(ms));
+    }
+
+    fn refresh_open_tabs_search_results(&mut self) {
+        let q = self.open_tabs_palette.query.clone();
+        if q.is_empty() {
+            self.open_tabs_palette.hits.clear();
+            self.open_tabs_palette.last_error = None;
+            self.open_tabs_palette.hint = None;
+            self.open_tabs_palette.selected = 0;
+            self.open_tabs_palette.scroll = 0;
+            return;
+        }
+        let config = SearchConfig {
+            pattern: q,
+            is_regex: self.settings.find_in_open_tabs_regex,
+            case_sensitive: self.settings.find_in_open_tabs_case_sensitive,
+            whole_word: self.settings.find_in_open_tabs_whole_word,
+        };
+        let max_r = self.settings.find_in_open_tabs_max_results;
+        let max_c = self.settings.find_in_open_tabs_max_chars_per_tab;
+        let (hits, skipped, err) = search_open_tabs(&self.documents, &config, max_r, max_c);
+        self.open_tabs_palette.hits = hits;
+        let have_err = err.is_some();
+        self.open_tabs_palette.last_error = err;
+        self.open_tabs_palette.hint = if have_err {
+            if skipped > 0 {
+                Some(format!(
+                    "Also: {} tab(s) skipped (larger than find_in_open_tabs_max_chars_per_tab).",
+                    skipped
+                ))
+            } else {
+                None
+            }
+        } else if skipped > 0 {
+            Some(format!(
+                "Skipped {} tab(s) larger than find_in_open_tabs_max_chars_per_tab ({}).",
+                skipped, max_c
+            ))
+        } else if self.open_tabs_palette.hits.is_empty() {
+            Some("No matches in open tabs.".to_string())
+        } else {
+            None
+        };
+        if !self.open_tabs_palette.hits.is_empty() {
+            self.open_tabs_palette.selected = self
+                .open_tabs_palette
+                .selected
+                .min(self.open_tabs_palette.hits.len().saturating_sub(1));
+        } else {
+            self.open_tabs_palette.selected = 0;
+        }
+        self.open_tabs_palette.scroll = 0;
+    }
+
+    fn flush_open_tabs_debounce_if_ready(&mut self) -> bool {
+        if !self.open_tabs_palette.visible {
+            return false;
+        }
+        let Some(deadline) = self.open_tabs_debounce_at else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.open_tabs_debounce_at = None;
+        self.refresh_open_tabs_search_results();
+        true
+    }
+
+    fn run_open_tabs_selection(&mut self) {
+        let hit = self.open_tabs_palette.selected_hit().cloned();
+        let Some(hit) = hit else {
+            return;
+        };
+        let vh = self.viewport_height;
+        let vw = self.viewport_width;
+        self.open_tabs_palette.close();
+        self.open_tabs_debounce_at = None;
+        self.active_tab = hit.tab_index;
+        let doc = &mut self.documents[self.active_tab];
+        let line = doc.buffer.char_to_line(hit.match_start);
+        let line_start = doc.buffer.line_to_char(line);
+        let col = hit.match_start.saturating_sub(line_start);
+        doc.cursor.goto(line, col, &doc.buffer);
+        self.ghost_suggestion = None;
+        self.ghost_trigger_pos = None;
+        self.ai_pending = false;
+        self.completion_list = None;
+        doc.cursor.clear_selection();
+        doc.ensure_cursor_visible(vh, vw);
+    }
+
+    fn handle_open_tabs_palette_key(&mut self, key: KeyEvent) {
+        let vis = Self::OUTLINE_LIST_VISIBLE;
+        match key.code {
+            KeyCode::Esc => {
+                self.open_tabs_palette.close();
+                self.open_tabs_debounce_at = None;
+            }
+            KeyCode::Enter => self.run_open_tabs_selection(),
+            KeyCode::Up => {
+                self.open_tabs_palette.move_selection(-1, vis);
+            }
+            KeyCode::Down => {
+                self.open_tabs_palette.move_selection(1, vis);
+            }
+            KeyCode::Backspace => {
+                self.open_tabs_palette.query.pop();
+                self.schedule_open_tabs_search_debounce();
+            }
+            KeyCode::Char(c) => {
+                self.open_tabs_palette.query.push(c);
+                self.schedule_open_tabs_search_debounce();
+            }
+            _ => {}
+        }
+    }
+
+    const OUTLINE_LIST_VISIBLE: usize = 10;
+
+    fn open_outline_palette(&mut self) {
+        self.command_palette.close();
+        self.open_tabs_palette.close();
+        self.ai_panel.close();
+        self.open_tabs_debounce_at = None;
+        let tab = self.active_tab;
+        let doc = &self.documents[tab];
+        let max_b = self.settings.outline_max_bytes;
+        let nbytes = doc.buffer.rope.len_bytes();
+        if nbytes > max_b {
+            self.outline_palette.open_into(
+                vec![],
+                Some(format!(
+                    "File too large for outline ({} bytes; outline_max_bytes = {}).",
+                    nbytes, max_b
+                )),
+                None,
+            );
+            return;
+        }
+        let text = doc.buffer.to_string();
+        let syms = crate::feature::outline::extract_symbols(&doc.language, &text);
+        let hint = if syms.is_empty() {
+            Some("No symbols for this language.".to_string())
+        } else {
+            None
+        };
+        self.outline_palette.open_into(syms, hint, None);
+    }
+
+    fn run_outline_selection(&mut self) {
+        let sym = self.outline_palette.selected_symbol().cloned();
+        let vh = self.viewport_height;
+        let vw = self.viewport_width;
+        self.outline_palette.close();
+        let Some(sym) = sym else {
+            return;
+        };
+        let tab = self.active_tab;
+        let doc = &mut self.documents[tab];
+        doc.cursor
+            .goto(sym.start_line, sym.name_start_col, &doc.buffer);
+        self.ghost_suggestion = None;
+        self.ghost_trigger_pos = None;
+        self.ai_pending = false;
+        self.completion_list = None;
+        doc.ensure_cursor_visible(vh, vw);
+    }
+
+    fn handle_outline_palette_key(&mut self, key: KeyEvent) {
+        let vis = Self::OUTLINE_LIST_VISIBLE;
+        match key.code {
+            KeyCode::Esc => self.outline_palette.close(),
+            KeyCode::Enter => self.run_outline_selection(),
+            KeyCode::Up => {
+                self.outline_palette.move_selection(-1, vis);
+            }
+            KeyCode::Down => {
+                self.outline_palette.move_selection(1, vis);
+            }
+            KeyCode::Backspace => {
+                self.outline_palette.filter.pop();
+                self.outline_palette.rebuild_filtered();
+            }
+            KeyCode::Char(c) => {
+                self.outline_palette.filter.push(c);
+                self.outline_palette.rebuild_filtered();
+            }
+            _ => {}
+        }
+    }
+
     /// Run the main application event loop.
     pub fn run(&mut self) -> Result<()> {
         enable_raw_mode()?;
@@ -408,6 +918,7 @@ impl App {
 
     /// The core event loop.
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+        self.sync_bracket_highlight();
         loop {
             if self.dirty {
                 terminal.draw(|frame| self.render(frame))?;
@@ -455,6 +966,34 @@ impl App {
                 }
             }
 
+            while let Ok((gen, reply)) = self.gemini_rx.try_recv() {
+                if self.ai_panel.pending_req_id == Some(gen) {
+                    self.ai_panel.pending_req_id = None;
+                    self.ai_panel.loading = false;
+                    match reply {
+                        Ok(text) => {
+                            self.ai_panel.turns.push(GeminiTurn {
+                                role: ChatRole::Model,
+                                text,
+                            });
+                            self.ai_panel.error = None;
+                            self.ai_panel.stick_transcript_to_bottom = true;
+                        }
+                        Err(e) => {
+                            self.ai_panel.error = Some(e.to_string());
+                            if let Some(t) = self.ai_panel.turns.pop() {
+                                if matches!(t.role, ChatRole::User) {
+                                    self.ai_panel.input = t.text;
+                                } else {
+                                    self.ai_panel.turns.push(t);
+                                }
+                            }
+                        }
+                    }
+                    self.dirty = true;
+                }
+            }
+
             if event::poll(Duration::from_millis(16))? {
                 let evt = event::read()?;
                 self.handle_event(evt);
@@ -471,6 +1010,15 @@ impl App {
                 if self.flush_find_debounce_if_ready() {
                     tick_dirty = true;
                 }
+                if self.flush_open_tabs_debounce_if_ready() {
+                    tick_dirty = true;
+                }
+                if self.ai_panel.visible
+                    && (self.ai_panel.loading || self.ai_panel.send_pulse > 0)
+                {
+                    self.ai_panel.tick_spinner();
+                    tick_dirty = true;
+                }
                 if tick_dirty {
                     self.dirty = true;
                 }
@@ -483,8 +1031,14 @@ impl App {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key_event) => {
-                if self.command_palette.visible {
+                if self.open_tabs_palette.visible {
+                    self.handle_open_tabs_palette_key(key_event);
+                } else if self.outline_palette.visible {
+                    self.handle_outline_palette_key(key_event);
+                } else if self.command_palette.visible {
                     self.handle_command_palette_key(key_event);
+                } else if self.ai_panel.visible {
+                    self.handle_ai_panel_key(key_event);
                 } else if self.modal.is_some() {
                     self.handle_modal_key(key_event);
                 } else if let Some(ref mut comp) = self.completion_list {
@@ -858,21 +1412,48 @@ impl App {
                 self.ghost_trigger_pos = None;
                 self.ai_pending = false;
                 self.completion_list = None;
+                self.ai_panel.close();
+                self.open_tabs_palette.close();
+                self.open_tabs_debounce_at = None;
                 if let Some(ref mut m) = self.modal {
                     if m.kind == ModalKind::Find {
                         m.find_bar_focus = FindBarFocus::Query;
                         self.find_bar_anim_frames = 4;
-                        return;
+                    } else {
+                        self.modal = Some(ModalState::find());
                     }
+                } else {
+                    self.modal = Some(ModalState::find());
                 }
-                self.modal = Some(ModalState::find());
             }
             Action::FindReplace => {
                 self.ghost_suggestion = None;
                 self.ghost_trigger_pos = None;
                 self.ai_pending = false;
                 self.completion_list = None;
+                self.ai_panel.close();
+                self.open_tabs_palette.close();
+                self.open_tabs_debounce_at = None;
                 self.modal = Some(ModalState::find_replace());
+            }
+            Action::FindInOpenTabs => {
+                if !self.settings.find_in_open_tabs_enabled {
+                    self.status_message = Some(
+                        "Find in Open Tabs is disabled (find_in_open_tabs_enabled = false)."
+                            .to_string(),
+                    );
+                } else {
+                    self.ghost_suggestion = None;
+                    self.ghost_trigger_pos = None;
+                    self.ai_pending = false;
+                    self.completion_list = None;
+                    if self.open_tabs_palette.visible {
+                        self.open_tabs_palette.close();
+                        self.open_tabs_debounce_at = None;
+                    } else {
+                        self.open_find_in_open_tabs_palette();
+                    }
+                }
             }
             Action::FindNext => {
                 if let Some(m) = self.search.next_match().cloned() {
@@ -897,7 +1478,30 @@ impl App {
                 self.ghost_trigger_pos = None;
                 self.ai_pending = false;
                 self.completion_list = None;
+                self.ai_panel.close();
+                self.outline_palette.close();
+                self.open_tabs_palette.close();
+                self.open_tabs_debounce_at = None;
                 self.modal = Some(ModalState::goto_line());
+            }
+            Action::GoToSymbol => {
+                if !self.settings.outline_enabled {
+                    self.status_message =
+                        Some("Go to Symbol is disabled (outline_enabled = false).".to_string());
+                } else {
+                    self.ghost_suggestion = None;
+                    self.ghost_trigger_pos = None;
+                    self.ai_pending = false;
+                    self.completion_list = None;
+                    if self.outline_palette.visible {
+                        self.outline_palette.close();
+                    } else {
+                        self.open_outline_palette();
+                    }
+                }
+            }
+            Action::GoToMatchingBracket => {
+                self.go_to_matching_bracket_action();
             }
             Action::EscapeSearch => {
                 self.search.clear();
@@ -911,11 +1515,54 @@ impl App {
             Action::ToggleFileTree => {
                 self.show_file_tree = !self.show_file_tree;
             }
-            Action::ToggleAiPanel => {}
+            Action::ToggleAiPanel => {
+                if !self.settings.ai_enabled {
+                    self.status_message =
+                        Some("AI is disabled for this run (see --no-ai or ai_enabled).".to_string());
+                } else if self.ai_panel.visible {
+                    self.sync_ai_chat_model_setting();
+                    self.ai_panel.close();
+                } else {
+                    self.command_palette.close();
+                    self.outline_palette.close();
+                    self.open_tabs_palette.close();
+                    self.open_tabs_debounce_at = None;
+                    self.ai_panel.open();
+                }
+            }
+            Action::AiInsertLastReply => {
+                if self.ai_panel.visible {
+                    self.insert_last_ai_reply_at_cursor();
+                }
+            }
+            Action::AiBrainstorm => {
+                if !self.settings.ai_enabled {
+                    self.status_message =
+                        Some("AI is disabled for this run (see --no-ai or ai_enabled).".to_string());
+                } else {
+                    self.command_palette.close();
+                    self.outline_palette.close();
+                    self.open_tabs_palette.close();
+                    self.open_tabs_debounce_at = None;
+                    let tab = self.active_tab;
+                    let doc = &self.documents[tab];
+                    let file_display = doc.display_name().to_string();
+                    let language = doc.language.clone();
+                    self.ai_panel.open();
+                    self.ai_panel.input =
+                        gemini_chat::brainstorm_user_prompt(&file_display, &language);
+                    self.ai_panel.error = None;
+                    self.ai_panel.stick_transcript_to_bottom = true;
+                }
+            }
             Action::CommandPalette => {
                 if self.command_palette.visible {
                     self.command_palette.close();
                 } else {
+                    self.outline_palette.close();
+                    self.open_tabs_palette.close();
+                    self.open_tabs_debounce_at = None;
+                    self.ai_panel.close();
                     self.command_palette.open();
                 }
             }
@@ -974,6 +1621,8 @@ impl App {
 
             _ => {}
         }
+
+        self.sync_bracket_highlight();
 
         // Invalidate ghost suggestion when cursor moved to another line
         if let Some((trigger_line, _)) = self.ghost_trigger_pos {
@@ -1505,6 +2154,7 @@ impl App {
             }
             _ => {}
         }
+        self.sync_bracket_highlight();
     }
 
     /// Render the entire UI.
@@ -1568,11 +2218,13 @@ impl App {
         };
         let completion_dropdown = self.completion_list.as_ref().map(|c| (c.items.as_slice(), c.selected));
         let show_match_strip = self.search.match_count() > 0;
+        let bracket_hl = self.bracket_highlight;
         frame.render_widget(
             EditorPane::new(doc, &self.theme, hl, &self.search)
                 .ghost_text(ghost_text)
                 .completion_dropdown(completion_dropdown)
-                .match_strip(show_match_strip),
+                .match_strip(show_match_strip)
+                .bracket_highlight(bracket_hl),
             editor_area,
         );
 
@@ -1596,6 +2248,36 @@ impl App {
             frame.render_widget(
                 CommandPaletteWidget {
                     state: &self.command_palette,
+                    theme: &self.theme,
+                },
+                editor_area,
+            );
+        }
+
+        if self.outline_palette.visible {
+            frame.render_widget(
+                OutlinePaletteWidget {
+                    state: &self.outline_palette,
+                    theme: &self.theme,
+                },
+                editor_area,
+            );
+        }
+
+        if self.open_tabs_palette.visible {
+            frame.render_widget(
+                OpenTabsPaletteWidget {
+                    state: &self.open_tabs_palette,
+                    theme: &self.theme,
+                },
+                editor_area,
+            );
+        }
+
+        if self.ai_panel.visible {
+            frame.render_widget(
+                AiPanelWidget {
+                    state: &self.ai_panel,
                     theme: &self.theme,
                 },
                 editor_area,

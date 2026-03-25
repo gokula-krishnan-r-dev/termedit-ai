@@ -46,6 +46,8 @@ pub struct UiColors {
     pub ai_response_bg: Color,
     pub search_match_bg: Color,
     pub search_current_bg: Color,
+    /// Background for the bracket matching the cursor (`()`, `[]`, `{}`).
+    pub bracket_match_bg: Color,
     pub find_bar_bg: Color,
     pub find_toggle_on_bg: Color,
     pub find_toggle_off_fg: Color,
@@ -92,6 +94,7 @@ struct UiToml {
     ai_response_bg: Option<String>,
     search_match_bg: Option<String>,
     search_current_bg: Option<String>,
+    bracket_match_bg: Option<String>,
     find_bar_bg: Option<String>,
     find_toggle_on_bg: Option<String>,
     find_toggle_off_fg: Option<String>,
@@ -162,6 +165,7 @@ impl Theme {
             ai_response_bg: None,
             search_match_bg: None,
             search_current_bg: None,
+            bracket_match_bg: None,
             find_bar_bg: None,
             find_toggle_on_bg: None,
             find_toggle_off_fg: None,
@@ -222,6 +226,10 @@ impl Theme {
                     &ui_toml.search_current_bg,
                     Color::Rgb(120, 100, 20),
                 ),
+                bracket_match_bg: color_or(
+                    &ui_toml.bracket_match_bg,
+                    Color::Rgb(55, 72, 62),
+                ),
                 find_bar_bg: color_or(&ui_toml.find_bar_bg, Color::Rgb(45, 45, 48)),
                 find_toggle_on_bg: color_or(
                     &ui_toml.find_toggle_on_bg,
@@ -279,6 +287,7 @@ impl Theme {
                 ai_response_bg: Color::Rgb(37, 37, 38),
                 search_match_bg: Color::Rgb(81, 69, 16),
                 search_current_bg: Color::Rgb(120, 100, 20),
+                bracket_match_bg: Color::Rgb(55, 72, 62),
                 find_bar_bg: Color::Rgb(45, 45, 48),
                 find_toggle_on_bg: Color::Rgb(0, 122, 204),
                 find_toggle_off_fg: Color::Rgb(150, 150, 150),
@@ -330,6 +339,7 @@ impl Theme {
                 ai_response_bg: Color::Rgb(33, 37, 43),
                 search_match_bg: Color::Rgb(72, 56, 0),
                 search_current_bg: Color::Rgb(100, 80, 10),
+                bracket_match_bg: Color::Rgb(45, 60, 52),
                 find_bar_bg: Color::Rgb(40, 44, 52),
                 find_toggle_on_bg: Color::Rgb(97, 175, 239),
                 find_toggle_off_fg: Color::Rgb(106, 110, 120),
@@ -381,6 +391,7 @@ impl Theme {
                 ai_response_bg: Color::Rgb(24, 24, 37),
                 search_match_bg: Color::Rgb(69, 60, 20),
                 search_current_bg: Color::Rgb(100, 90, 30),
+                bracket_match_bg: Color::Rgb(50, 58, 70),
                 find_bar_bg: Color::Rgb(36, 39, 58),
                 find_toggle_on_bg: Color::Rgb(137, 180, 250),
                 find_toggle_off_fg: Color::Rgb(148, 153, 178),
@@ -393,12 +404,65 @@ impl Theme {
         }
     }
 
+    /// Tokyo Night Storm–style built-in theme.
+    pub fn tokyo_night() -> Self {
+        let mut syntax = HashMap::new();
+        syntax.insert("keyword".to_string(), Color::Rgb(187, 154, 247));
+        syntax.insert("string".to_string(), Color::Rgb(158, 206, 106));
+        syntax.insert("number".to_string(), Color::Rgb(255, 158, 100));
+        syntax.insert("comment".to_string(), Color::Rgb(86, 95, 137));
+        syntax.insert("function".to_string(), Color::Rgb(122, 162, 247));
+        syntax.insert("type_name".to_string(), Color::Rgb(42, 195, 222));
+        syntax.insert("variable".to_string(), Color::Rgb(192, 202, 245));
+        syntax.insert("operator".to_string(), Color::Rgb(154, 167, 219));
+        syntax.insert("constant".to_string(), Color::Rgb(255, 158, 100));
+        syntax.insert("attribute".to_string(), Color::Rgb(125, 207, 255));
+        syntax.insert("punctuation".to_string(), Color::Rgb(154, 167, 219));
+
+        Self {
+            name: "tokyo-night".to_string(),
+            editor: EditorColors {
+                background: Color::Rgb(26, 27, 38),
+                foreground: Color::Rgb(192, 202, 245),
+                cursor: Color::Rgb(192, 202, 245),
+                selection_bg: Color::Rgb(40, 52, 87),
+                line_number: Color::Rgb(86, 95, 137),
+                line_number_active: Color::Rgb(165, 173, 206),
+                gutter_bg: Color::Rgb(26, 27, 38),
+                current_line_bg: Color::Rgb(41, 46, 66),
+            },
+            syntax,
+            ui: UiColors {
+                status_bar_bg: Color::Rgb(36, 40, 59),
+                status_bar_fg: Color::Rgb(154, 167, 219),
+                tab_active_bg: Color::Rgb(26, 27, 38),
+                tab_inactive_bg: Color::Rgb(36, 40, 59),
+                tab_fg: Color::Rgb(165, 173, 206),
+                panel_border: Color::Rgb(59, 66, 97),
+                ai_ghost_text: Color::Rgb(86, 95, 137),
+                ai_response_bg: Color::Rgb(36, 40, 59),
+                search_match_bg: Color::Rgb(61, 66, 97),
+                search_current_bg: Color::Rgb(90, 95, 130),
+                bracket_match_bg: Color::Rgb(45, 55, 70),
+                find_bar_bg: Color::Rgb(36, 40, 59),
+                find_toggle_on_bg: Color::Rgb(122, 162, 247),
+                find_toggle_off_fg: Color::Rgb(122, 124, 156),
+            },
+            git: GitColors {
+                added: Color::Rgb(158, 206, 106),
+                modified: Color::Rgb(122, 162, 247),
+                deleted: Color::Rgb(247, 118, 142),
+            },
+        }
+    }
+
     /// Get a built-in theme by name.
     pub fn builtin(name: &str) -> Option<Self> {
         match name {
             "dark-plus" => Some(Self::dark_plus()),
             "one-dark-pro" => Some(Self::one_dark_pro()),
             "catppuccin-mocha" => Some(Self::catppuccin_mocha()),
+            "tokyo-night" => Some(Self::tokyo_night()),
             _ => None,
         }
     }
@@ -456,6 +520,7 @@ mod tests {
         assert!(Theme::builtin("dark-plus").is_some());
         assert!(Theme::builtin("one-dark-pro").is_some());
         assert!(Theme::builtin("catppuccin-mocha").is_some());
+        assert!(Theme::builtin("tokyo-night").is_some());
         assert!(Theme::builtin("nonexistent").is_none());
     }
 

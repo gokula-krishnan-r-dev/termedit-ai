@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use regex::Regex;
 use ropey::Rope;
 
+use crate::core::document::Document;
+
 /// A single search match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchMatch {
@@ -51,6 +53,202 @@ impl SearchConfig {
     }
 }
 
+/// One match when searching across open tabs (for the picker UI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTabHit {
+    /// Index into the app's `documents` vector.
+    pub tab_index: usize,
+    /// [`Buffer::display_name`](crate::core::buffer::Buffer::display_name) for the tab.
+    pub tab_label: String,
+    /// Start character index in that buffer's rope.
+    pub match_start: usize,
+    /// Line index (0-based) containing the match.
+    pub line: usize,
+    /// Single-line preview (trimmed, may end with …).
+    pub preview: String,
+}
+
+/// Collect matches without mutating [`Search`] state (literal uses rope scan; regex allocates `rope.to_string()`).
+pub fn collect_matches(config: &SearchConfig, rope: &Rope) -> (Vec<SearchMatch>, Option<String>) {
+    let mut matches = Vec::new();
+    if config.pattern.is_empty() {
+        return (matches, None);
+    }
+    if config.is_regex {
+        let text = rope.to_string();
+        let err = collect_regex_matches(config, rope, &text, &mut matches);
+        (matches, err)
+    } else {
+        collect_literal_rope_matches(config, rope, &mut matches);
+        (matches, None)
+    }
+}
+
+fn is_whole_word_rope(rope: &Rope, char_start: usize, pat_len_chars: usize) -> bool {
+    let before_ok = char_start == 0 || {
+        let c = rope.char(char_start - 1);
+        !c.is_alphanumeric() && c != '_'
+    };
+    let end = char_start + pat_len_chars;
+    let after_ok = end >= rope.len_chars() || {
+        let c = rope.char(end);
+        !c.is_alphanumeric() && c != '_'
+    };
+    before_ok && after_ok
+}
+
+fn collect_literal_rope_matches(config: &SearchConfig, rope: &Rope, out: &mut Vec<SearchMatch>) {
+    let pattern = &config.pattern;
+    let pat_chars: Vec<char> = pattern.chars().collect();
+    let plen = pat_chars.len();
+    if plen == 0 {
+        return;
+    }
+    let n = rope.len_chars();
+    if plen > n {
+        return;
+    }
+
+    let pat_lower: Option<Vec<String>> = if config.case_sensitive {
+        None
+    } else {
+        Some(
+            pat_chars
+                .iter()
+                .map(|c| c.to_lowercase().to_string())
+                .collect(),
+        )
+    };
+
+    'outer: for i in 0..=n - plen {
+        for j in 0..plen {
+            let rc = rope.char(i + j);
+            let ok = if config.case_sensitive {
+                rc == pat_chars[j]
+            } else {
+                rc.to_lowercase().to_string() == pat_lower.as_ref().unwrap()[j]
+            };
+            if !ok {
+                continue 'outer;
+            }
+        }
+        if config.whole_word && !is_whole_word_rope(rope, i, plen) {
+            continue;
+        }
+        let matched: String = (0..plen).map(|k| rope.char(i + k)).collect();
+        out.push(SearchMatch {
+            start: i,
+            end: i + plen,
+            text: matched,
+        });
+    }
+}
+
+fn collect_regex_matches(
+    config: &SearchConfig,
+    rope: &Rope,
+    text: &str,
+    out: &mut Vec<SearchMatch>,
+) -> Option<String> {
+    let regex_pattern = if config.case_sensitive {
+        config.pattern.clone()
+    } else {
+        format!("(?i){}", config.pattern)
+    };
+
+    let re = match Regex::new(&regex_pattern) {
+        Ok(r) => r,
+        Err(e) => return Some(format!("Invalid regex: {}", e)),
+    };
+
+    for mat in re.find_iter(text) {
+        let char_start = text[..mat.start()].chars().count();
+        let matched = mat.as_str();
+        let char_len = matched.chars().count();
+        if config.whole_word && !is_whole_word_rope(rope, char_start, char_len) {
+            continue;
+        }
+
+        out.push(SearchMatch {
+            start: char_start,
+            end: char_start + char_len,
+            text: matched.to_string(),
+        });
+    }
+    None
+}
+
+/// Search all open tabs in order; skips buffers larger than `max_chars_per_tab` (counts as one skip each).
+pub fn search_open_tabs(
+    documents: &[Document],
+    config: &SearchConfig,
+    max_results: usize,
+    max_chars_per_tab: usize,
+) -> (Vec<OpenTabHit>, usize, Option<String>) {
+    let mut hits = Vec::new();
+    let mut skipped_tabs = 0usize;
+
+    if config.pattern.is_empty() {
+        return (hits, skipped_tabs, None);
+    }
+
+    if config.is_regex {
+        let regex_pattern = if config.case_sensitive {
+            config.pattern.clone()
+        } else {
+            format!("(?i){}", config.pattern)
+        };
+        if let Err(e) = Regex::new(&regex_pattern) {
+            return (hits, skipped_tabs, Some(format!("Invalid regex: {}", e)));
+        }
+    }
+
+    const PREVIEW_MAX: usize = 120;
+
+    for (tab_index, doc) in documents.iter().enumerate() {
+        if hits.len() >= max_results {
+            break;
+        }
+        let rope = &doc.buffer.rope;
+        let n = rope.len_chars();
+        if n > max_chars_per_tab {
+            skipped_tabs += 1;
+            continue;
+        }
+
+        let (matches, err) = collect_matches(config, rope);
+        if let Some(e) = err {
+            return (hits, skipped_tabs, Some(e));
+        }
+
+        for m in matches {
+            if hits.len() >= max_results {
+                break;
+            }
+            let line = rope.char_to_line(m.start);
+            let mut preview = doc.buffer.line_text(line);
+            preview = preview.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            if preview.chars().count() > PREVIEW_MAX {
+                let truncated: String = preview.chars().take(PREVIEW_MAX.saturating_sub(1)).collect();
+                preview = format!("{}…", truncated);
+            }
+            hits.push(OpenTabHit {
+                tab_index,
+                tab_label: doc.buffer.display_name(),
+                match_start: m.start,
+                line,
+                preview,
+            });
+
+            if hits.len() >= max_results {
+                break;
+            }
+        }
+    }
+
+    (hits, skipped_tabs, None)
+}
+
 /// Search engine for find and replace operations.
 pub struct Search {
     /// Current search matches.
@@ -89,12 +287,9 @@ impl Search {
             return &self.matches;
         }
 
-        if config.is_regex {
-            let text = rope.to_string();
-            self.find_regex(&config, rope, &text);
-        } else {
-            self.find_literal_rope(&config, rope);
-        }
+        let (matches, err) = collect_matches(&config, rope);
+        self.matches = matches;
+        self.last_error = err;
 
         if !self.matches.is_empty() {
             self.current_match = Some(0);
@@ -106,134 +301,6 @@ impl Search {
 
         self.config = Some(config);
         &self.matches
-    }
-
-    /// Find literal matches by scanning the rope (no full-document `String` copy).
-    fn find_literal_rope(&mut self, config: &SearchConfig, rope: &Rope) {
-        let pattern = &config.pattern;
-        let pat_chars: Vec<char> = pattern.chars().collect();
-        let plen = pat_chars.len();
-        if plen == 0 {
-            return;
-        }
-        let n = rope.len_chars();
-        if plen > n {
-            return;
-        }
-
-        let pat_lower: Option<Vec<String>> = if config.case_sensitive {
-            None
-        } else {
-            Some(
-                pat_chars
-                    .iter()
-                    .map(|c| c.to_lowercase().to_string())
-                    .collect(),
-            )
-        };
-
-        'outer: for i in 0..=n - plen {
-            for j in 0..plen {
-                let rc = rope.char(i + j);
-                let ok = if config.case_sensitive {
-                    rc == pat_chars[j]
-                } else {
-                    rc.to_lowercase().to_string() == pat_lower.as_ref().unwrap()[j]
-                };
-                if !ok {
-                    continue 'outer;
-                }
-            }
-            if config.whole_word && !self.is_whole_word_rope(rope, i, plen) {
-                continue;
-            }
-            let matched: String = (0..plen).map(|k| rope.char(i + k)).collect();
-            self.matches.push(SearchMatch {
-                start: i,
-                end: i + plen,
-                text: matched,
-            });
-        }
-    }
-
-    fn is_whole_word_rope(&self, rope: &Rope, char_start: usize, pat_len_chars: usize) -> bool {
-        let before_ok = char_start == 0 || {
-            let c = rope.char(char_start - 1);
-            !c.is_alphanumeric() && c != '_'
-        };
-        let end = char_start + pat_len_chars;
-        let after_ok = end >= rope.len_chars() || {
-            let c = rope.char(end);
-            !c.is_alphanumeric() && c != '_'
-        };
-        before_ok && after_ok
-    }
-
-    /// Find literal text matches (used by tests and byte-oriented callers).
-    fn find_literal(&mut self, config: &SearchConfig, text: &str) {
-        let pattern = &config.pattern;
-        let search_text;
-        let search_pattern;
-
-        if config.case_sensitive {
-            search_text = text.to_string();
-            search_pattern = pattern.to_string();
-        } else {
-            search_text = text.to_lowercase();
-            search_pattern = pattern.to_lowercase();
-        }
-
-        let mut start = 0;
-        while let Some(pos) = search_text[start..].find(&search_pattern) {
-            let abs_pos = start + pos;
-            // Convert byte offset to char offset
-            let char_start = text[..abs_pos].chars().count();
-            let char_end = char_start + pattern.chars().count();
-            let matched_text = text[abs_pos..abs_pos + pattern.len()].to_string();
-
-            if !config.whole_word || self.is_whole_word(text, abs_pos, pattern.len()) {
-                self.matches.push(SearchMatch {
-                    start: char_start,
-                    end: char_end,
-                    text: matched_text,
-                });
-            }
-
-            start = abs_pos + pattern.len().max(1);
-        }
-    }
-
-    /// Find regex matches (`text` must be `rope.to_string()`; indices are rope char indices).
-    fn find_regex(&mut self, config: &SearchConfig, rope: &Rope, text: &str) {
-        let regex_pattern = if config.case_sensitive {
-            config.pattern.clone()
-        } else {
-            format!("(?i){}", config.pattern)
-        };
-
-        let re = match Regex::new(&regex_pattern) {
-            Ok(r) => r,
-            Err(e) => {
-                self.last_error = Some(format!("Invalid regex: {}", e));
-                return;
-            }
-        };
-
-        for mat in re.find_iter(text) {
-            let char_start = text[..mat.start()].chars().count();
-            let matched = mat.as_str();
-            let char_len = matched.chars().count();
-            let char_end = char_start + char_len;
-            if config.whole_word && !self.is_whole_word_rope(rope, char_start, char_len) {
-                continue;
-            }
-
-            self.matches.push(SearchMatch {
-                start: char_start,
-                end: char_end,
-                text: matched.to_string(),
-            });
-        }
     }
 
     /// Check if the match at byte position is a whole word.
@@ -465,5 +532,79 @@ mod tests {
         );
         assert_eq!(search.match_count(), 0);
         assert!(search.last_error.is_some());
+    }
+
+    #[test]
+    fn collect_matches_literal_empty_pattern() {
+        let rope = Rope::from_str("abc");
+        let (m, e) = collect_matches(&SearchConfig::literal(""), &rope);
+        assert!(m.is_empty());
+        assert!(e.is_none());
+    }
+
+    #[test]
+    fn collect_matches_literal_matches_find() {
+        let rope = Rope::from_str("hello world hello");
+        let cfg = SearchConfig::literal("hello");
+        let (m, e) = collect_matches(&cfg, &rope);
+        assert!(e.is_none());
+        let mut search = Search::new();
+        search.find(cfg, &rope);
+        assert_eq!(m, search.matches);
+    }
+
+    #[test]
+    fn collect_matches_invalid_regex() {
+        let rope = Rope::from_str("x");
+        let cfg = SearchConfig {
+            pattern: r"(".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            whole_word: false,
+        };
+        let (m, e) = collect_matches(&cfg, &rope);
+        assert!(m.is_empty());
+        assert!(e.is_some());
+    }
+
+    #[test]
+    fn search_open_tabs_two_buffers() {
+        let mut a = Document::new();
+        a.insert_text("fn foo() {}\n");
+        let mut b = Document::new();
+        b.insert_text("foo bar\nbaz foo\n");
+
+        let docs = vec![a, b];
+        let cfg = SearchConfig::case_insensitive("foo");
+        let (hits, skipped, err) = search_open_tabs(&docs, &cfg, 100, 2_000_000);
+        assert!(err.is_none());
+        assert_eq!(skipped, 0);
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].tab_index, 0);
+        assert_eq!(hits[0].tab_label, "Untitled");
+        assert_eq!(hits[1].tab_index, 1);
+        assert_eq!(hits[2].tab_index, 1);
+    }
+
+    #[test]
+    fn search_open_tabs_skips_large_buffer() {
+        let mut huge = Document::new();
+        huge.insert_text(&"x".repeat(100));
+        let small = Document::new();
+        let docs = vec![huge, small];
+        let cfg = SearchConfig::literal("x");
+        let (_hits, skipped, err) = search_open_tabs(&docs, &cfg, 100, 10);
+        assert!(err.is_none());
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn search_open_tabs_max_results() {
+        let mut d = Document::new();
+        d.insert_text("a a a a a ");
+        let docs = vec![d];
+        let cfg = SearchConfig::literal("a");
+        let (hits, _, _) = search_open_tabs(&docs, &cfg, 2, 2_000_000);
+        assert_eq!(hits.len(), 2);
     }
 }
