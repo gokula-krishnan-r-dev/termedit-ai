@@ -26,6 +26,8 @@ pub struct EditorPane<'a> {
     ghost_text: Option<&'a str>,
     /// Completion dropdown: (items, selected index). Rendered below cursor line.
     completion_dropdown: Option<(&'a [String], usize)>,
+    /// When true, reserve the rightmost column for search match tick marks.
+    show_match_strip: bool,
 }
 
 impl<'a> EditorPane<'a> {
@@ -48,7 +50,14 @@ impl<'a> EditorPane<'a> {
             focused: true,
             ghost_text: None,
             completion_dropdown: None,
+            show_match_strip: false,
         }
+    }
+
+    /// Show a one-column overview of match lines on the right edge.
+    pub fn match_strip(mut self, on: bool) -> Self {
+        self.show_match_strip = on;
+        self
     }
 
     /// Set completion dropdown (list of items, selected index). Shown below cursor line.
@@ -213,7 +222,14 @@ impl<'a> Widget for EditorPane<'a> {
         }
 
         let viewport_height = area.height as usize;
-        let content_width = (area.width - self.gutter_width) as usize;
+        let show_strip = self.show_match_strip
+            && !self.search.match_lines.is_empty()
+            && area.width > self.gutter_width + 2;
+        let strip_cols = u16::from(show_strip);
+        let content_width = (area.width - self.gutter_width - strip_cols).max(1) as usize;
+        let content_right = area.x + self.gutter_width + content_width as u16;
+        let strip_x = area.x + area.width.saturating_sub(1);
+        let cur_line = self.search.current_match_line(&self.doc.buffer.rope);
 
         for row in 0..viewport_height {
             let line_idx = self.doc.scroll_y + row;
@@ -250,11 +266,28 @@ impl<'a> Widget for EditorPane<'a> {
                 for span in &spans {
                     for ch in span.content.chars() {
                         let x = text_x + col;
-                        if x < area.x + area.width {
+                        if x < content_right {
                             buf.set_string(x, y, ch.to_string(), span.style);
                         }
                         col += 1;
                     }
+                }
+
+                if show_strip {
+                    let st = if cur_line == Some(line_idx) {
+                        Style::default()
+                            .fg(self.theme.editor.foreground)
+                            .bg(self.theme.ui.search_current_bg)
+                    } else if self.search.match_lines.contains(&line_idx) {
+                        Style::default()
+                            .fg(self.theme.editor.foreground)
+                            .bg(self.theme.ui.search_match_bg)
+                    } else {
+                        Style::default()
+                            .fg(self.theme.ui.find_toggle_off_fg)
+                            .bg(self.theme.editor.background)
+                    };
+                    buf.set_string(strip_x, y, "▌", st);
                 }
             } else {
                 // Empty line below document — show tilde
@@ -266,8 +299,16 @@ impl<'a> Widget for EditorPane<'a> {
 
                 // Fill rest with background
                 let bg_style = Style::default().bg(self.theme.editor.background);
-                for x in (area.x + self.gutter_width)..area.x + area.width {
+                for x in (area.x + self.gutter_width)..content_right {
                     buf.set_string(x, y, " ", bg_style);
+                }
+                if show_strip {
+                    buf.set_string(
+                        strip_x,
+                        y,
+                        " ",
+                        Style::default().bg(self.theme.editor.background),
+                    );
                 }
             }
 
@@ -278,7 +319,7 @@ impl<'a> Widget for EditorPane<'a> {
             {
                 let cursor_x =
                     area.x + self.gutter_width + (self.doc.cursor.col - self.doc.scroll_x) as u16;
-                if cursor_x < area.x + area.width && cursor_x >= area.x + self.gutter_width {
+                if cursor_x < content_right && cursor_x >= area.x + self.gutter_width {
                     let cursor_style = Style::default()
                         .bg(self.theme.editor.cursor)
                         .fg(self.theme.editor.background)
@@ -311,7 +352,7 @@ impl<'a> Widget for EditorPane<'a> {
                         .fg(self.theme.ui.ai_ghost_text)
                         .bg(self.theme.editor.current_line_bg)
                         .add_modifier(Modifier::DIM);
-                    let max_x = area.x + area.width;
+                    let max_x = content_right;
                     let mut x = ghost_start_x;
                     for ch in ghost.chars().skip(start_skip) {
                         if x >= max_x {
@@ -336,7 +377,16 @@ impl<'a> Widget for EditorPane<'a> {
             }
             let max_h = (area.y + area.height - drop_y).min(10).min(items.len() as u16);
             let content_x = area.x + self.gutter_width;
-            let drop_width = area.width.saturating_sub(self.gutter_width).min(40);
+            let strip_cols = u16::from(
+                self.show_match_strip
+                    && !self.search.match_lines.is_empty()
+                    && area.width > self.gutter_width + 2,
+            );
+            let drop_width = area
+                .width
+                .saturating_sub(self.gutter_width)
+                .saturating_sub(strip_cols)
+                .min(40);
             let bg = self.theme.editor.background;
             let selected_bg = self.theme.ui.search_current_bg;
             let fg = self.theme.editor.foreground;

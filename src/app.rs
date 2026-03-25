@@ -29,14 +29,15 @@ use crate::core::cursor::SelectionMode;
 use crate::core::document::Document;
 use crate::feature::ai_completion::{self, AiContext};
 use crate::feature::completion;
-use crate::feature::search::{Search, SearchConfig};
+use crate::feature::search::Search;
 use crate::feature::session::{self, SessionState};
 use crate::feature::syntax::SyntaxHighlighter;
 use crate::ui::command_palette::{CommandPaletteState, CommandPaletteWidget};
 use crate::ui::editor_pane::EditorPane;
 use crate::ui::file_tree::FileTree;
 use crate::ui::modal::{
-    FindReplaceFocus, ModalKind, ModalState, ModalWidget, PathPromptMode,
+    find_replace_backtab, find_replace_tab, search_config_from_modal, FindBarFocus, FindReplaceFocus,
+    ModalKind, ModalState, ModalWidget, PathPromptMode,
 };
 use crate::ui::status_bar::StatusBar;
 use crate::ui::tab_bar::{TabBar, TabInfo};
@@ -110,6 +111,12 @@ pub struct App {
     ai_pending: bool,
     /// Inline completion dropdown: list of items, selected index, and prefix length for accept.
     completion_list: Option<CompletionList>,
+    /// Find bar focus transition frames (non-zero = pulse in UI).
+    find_bar_anim_frames: u8,
+    /// Debounced regex search deadline.
+    find_debounce_at: Option<Instant>,
+    /// Pending regex [`SearchConfig`] after debounce.
+    find_pending_config: Option<crate::feature::search::SearchConfig>,
 }
 
 /// State for the completion dropdown (keyword/buffer suggestions).
@@ -158,6 +165,9 @@ impl App {
             ai_request_sent_for: None,
             ai_pending: false,
             completion_list: None,
+            find_bar_anim_frames: 0,
+            find_debounce_at: None,
+            find_pending_config: None,
         }
     }
 
@@ -452,6 +462,17 @@ impl App {
 
                 if self.should_quit {
                     break;
+                }
+            } else {
+                let mut tick_dirty = false;
+                if self.tick_find_bar_animation() {
+                    tick_dirty = true;
+                }
+                if self.flush_find_debounce_if_ready() {
+                    tick_dirty = true;
+                }
+                if tick_dirty {
+                    self.dirty = true;
                 }
             }
         }
@@ -837,6 +858,13 @@ impl App {
                 self.ghost_trigger_pos = None;
                 self.ai_pending = false;
                 self.completion_list = None;
+                if let Some(ref mut m) = self.modal {
+                    if m.kind == ModalKind::Find {
+                        m.find_bar_focus = FindBarFocus::Query;
+                        self.find_bar_anim_frames = 4;
+                        return;
+                    }
+                }
                 self.modal = Some(ModalState::find());
             }
             Action::FindReplace => {
@@ -961,6 +989,136 @@ impl App {
         self.documents[self.active_tab].ensure_cursor_visible(vh, vw);
     }
 
+    fn apply_find_from_modal(&mut self, immediate: bool) {
+        let Some(ref modal) = self.modal else {
+            return;
+        };
+        if !matches!(modal.kind, ModalKind::Find | ModalKind::FindReplace) {
+            return;
+        }
+        if modal.kind == ModalKind::FindReplace
+            && modal.find_replace_focus == FindReplaceFocus::Replace
+        {
+            return;
+        }
+        let config = search_config_from_modal(modal);
+        let tab = self.active_tab;
+        let rope = &self.documents[tab].buffer.rope;
+        if config.is_regex && !immediate {
+            self.find_debounce_at = Some(Instant::now() + Duration::from_millis(120));
+            self.find_pending_config = Some(config);
+        } else {
+            self.find_debounce_at = None;
+            self.find_pending_config = None;
+            self.search.find(config, rope);
+        }
+    }
+
+    fn flush_find_debounce_now(&mut self) {
+        if let Some(cfg) = self.find_pending_config.take() {
+            self.find_debounce_at = None;
+            let tab = self.active_tab;
+            let rope = &self.documents[tab].buffer.rope;
+            self.search.find(cfg, rope);
+        }
+    }
+
+    fn flush_find_debounce_if_ready(&mut self) -> bool {
+        let Some(deadline) = self.find_debounce_at else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.find_debounce_at = None;
+        let Some(cfg) = self.find_pending_config.take() else {
+            return false;
+        };
+        let tab = self.active_tab;
+        let rope = &self.documents[tab].buffer.rope;
+        self.search.find(cfg, rope);
+        true
+    }
+
+    fn tick_find_bar_animation(&mut self) -> bool {
+        if self.find_bar_anim_frames == 0 {
+            return false;
+        }
+        if !matches!(
+            self.modal,
+            Some(ref m) if m.kind == ModalKind::Find || m.kind == ModalKind::FindReplace
+        ) {
+            self.find_bar_anim_frames = 0;
+            return false;
+        }
+        self.find_bar_anim_frames -= 1;
+        true
+    }
+
+    fn jump_to_search_match(&mut self, start_char: usize) {
+        let tab = self.active_tab;
+        let doc = &mut self.documents[tab];
+        let line = doc.buffer.char_to_line(start_char);
+        let line_start = doc.buffer.line_to_char(line);
+        let col = start_char - line_start;
+        doc.cursor.goto(line, col, &doc.buffer);
+        doc.ensure_cursor_visible(self.viewport_height, self.viewport_width);
+    }
+
+    fn modal_find_next(&mut self) {
+        self.flush_find_debounce_now();
+        if let Some(m) = self.search.next_match() {
+            let s = m.start;
+            self.jump_to_search_match(s);
+        }
+    }
+
+    fn modal_find_prev(&mut self) {
+        self.flush_find_debounce_now();
+        if let Some(m) = self.search.prev_match() {
+            let s = m.start;
+            self.jump_to_search_match(s);
+        }
+    }
+
+    fn modal_on_find_row(&self) -> bool {
+        self.modal.as_ref().is_some_and(|m| {
+            m.kind == ModalKind::Find
+                || (m.kind == ModalKind::FindReplace
+                    && m.find_replace_focus == FindReplaceFocus::Find)
+        })
+    }
+
+    fn modal_chrome_left_right(&mut self, dir_right: bool) {
+        let Some(modal) = self.modal.as_mut() else {
+            return;
+        };
+        let replace_only = modal.kind == ModalKind::FindReplace
+            && modal.find_replace_focus == FindReplaceFocus::Replace;
+        if replace_only {
+            if dir_right {
+                modal.cursor_right();
+            } else {
+                modal.cursor_left();
+            }
+            return;
+        }
+        if modal.find_query_focused() {
+            if dir_right {
+                modal.cursor_right();
+            } else {
+                modal.cursor_left();
+            }
+            return;
+        }
+        modal.find_bar_focus = if dir_right {
+            modal.find_bar_focus.next()
+        } else {
+            modal.find_bar_focus.prev()
+        };
+        self.find_bar_anim_frames = 4;
+    }
+
     /// Handle keyboard input when a modal is active.
     fn handle_modal_key(&mut self, key: KeyEvent) {
         let tab = self.active_tab;
@@ -968,12 +1126,6 @@ impl App {
         let modal_kind = match &self.modal {
             Some(m) => m.kind.clone(),
             None => return,
-        };
-
-        let live_find = |search: &mut Search, modal: &ModalState, doc_tab: usize, docs: &[Document]| {
-            let pattern = modal.input.clone();
-            let rope = &docs[doc_tab].buffer.rope;
-            search.find(SearchConfig::case_insensitive(&pattern), rope);
         };
 
         match key.code {
@@ -987,52 +1139,115 @@ impl App {
                 self.modal = None;
                 return;
             }
-            KeyCode::Tab if modal_kind == ModalKind::FindReplace => {
-                if let Some(modal) = self.modal.as_mut() {
-                    modal.toggle_find_replace_focus();
+            KeyCode::F(3) if matches!(modal_kind, ModalKind::Find | ModalKind::FindReplace) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.modal_find_prev();
+                } else {
+                    self.modal_find_next();
                 }
                 return;
             }
-            KeyCode::BackTab if modal_kind == ModalKind::FindReplace => {
-                if let Some(modal) = self.modal.as_mut() {
-                    modal.toggle_find_replace_focus();
+            KeyCode::Up if matches!(modal_kind, ModalKind::Find | ModalKind::FindReplace) => {
+                if self.modal_on_find_row() {
+                    self.modal_find_prev();
+                    return;
                 }
+            }
+            KeyCode::Down if matches!(modal_kind, ModalKind::Find | ModalKind::FindReplace) => {
+                if self.modal_on_find_row() {
+                    self.modal_find_next();
+                    return;
+                }
+            }
+            KeyCode::Tab if modal_kind == ModalKind::Find => {
+                if let Some(m) = self.modal.as_mut() {
+                    m.find_bar_focus = m.find_bar_focus.next();
+                }
+                self.find_bar_anim_frames = 4;
+                return;
+            }
+            KeyCode::BackTab if modal_kind == ModalKind::Find => {
+                if let Some(m) = self.modal.as_mut() {
+                    m.find_bar_focus = m.find_bar_focus.prev();
+                }
+                self.find_bar_anim_frames = 4;
+                return;
+            }
+            KeyCode::Tab if modal_kind == ModalKind::FindReplace => {
+                let landed_on_find = if let Some(m) = self.modal.as_mut() {
+                    let was_replace = m.find_replace_focus == FindReplaceFocus::Replace;
+                    find_replace_tab(m);
+                    was_replace && m.find_replace_focus == FindReplaceFocus::Find
+                } else {
+                    false
+                };
+                if landed_on_find {
+                    self.apply_find_from_modal(true);
+                }
+                self.find_bar_anim_frames = 4;
+                return;
+            }
+            KeyCode::BackTab if modal_kind == ModalKind::FindReplace => {
+                let landed_on_find = if let Some(m) = self.modal.as_mut() {
+                    let was_replace = m.find_replace_focus == FindReplaceFocus::Replace;
+                    find_replace_backtab(m);
+                    was_replace && m.find_replace_focus == FindReplaceFocus::Find
+                } else {
+                    false
+                };
+                if landed_on_find {
+                    self.apply_find_from_modal(true);
+                }
+                self.find_bar_anim_frames = 4;
                 return;
             }
             KeyCode::Enter => {
                 let ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL);
+                if matches!(modal_kind, ModalKind::Find | ModalKind::FindReplace) {
+                    if let Some(m) = self.modal.as_ref() {
+                        let on_find_row = modal_kind == ModalKind::Find
+                            || m.find_replace_focus == FindReplaceFocus::Find;
+                        if on_find_row && m.find_bar_focus == FindBarFocus::Close && !ctrl_enter {
+                            self.modal = None;
+                            return;
+                        }
+                    }
+                }
                 match &modal_kind {
                     ModalKind::Find => {
-                        let pattern = self
-                            .modal
-                            .as_ref()
-                            .map(|m| m.input.clone())
-                            .unwrap_or_default();
-                        self.modal = None;
-                        self.execute_search(&pattern);
+                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        self.flush_find_debounce_now();
+                        if shift {
+                            self.modal_find_prev();
+                        } else {
+                            self.modal_find_next();
+                        }
                     }
                     ModalKind::FindReplace => {
-                        let (pat, repl, focus) = self
+                        let (repl, focus) = self
                             .modal
                             .as_ref()
-                            .map(|m| {
-                                (
-                                    m.input.clone(),
-                                    m.replace_input.clone(),
-                                    m.find_replace_focus,
-                                )
-                            })
+                            .map(|m| (m.replace_input.clone(), m.find_replace_focus))
                             .unwrap_or_default();
                         match focus {
                             FindReplaceFocus::Find => {
-                                self.modal = None;
-                                self.execute_search(&pat);
+                                let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                                self.flush_find_debounce_now();
+                                if shift {
+                                    self.modal_find_prev();
+                                } else {
+                                    self.modal_find_next();
+                                }
                             }
                             FindReplaceFocus::Replace => {
+                                let cfg = self
+                                    .modal
+                                    .as_ref()
+                                    .map(search_config_from_modal)
+                                    .expect("modal");
                                 if ctrl_enter {
                                     let rope = &self.documents[tab].buffer.rope;
-                                    self.search
-                                        .find(SearchConfig::case_insensitive(&pat), rope);
+                                    self.search.find(cfg.clone(), rope);
                                     let matches_snapshot = self.search.matches.clone();
                                     let n = self.documents[tab]
                                         .replace_all_matches(&matches_snapshot, &repl);
@@ -1041,16 +1256,14 @@ impl App {
                                         Some(format!("Replaced {} occurrence(s)", n));
                                 } else {
                                     let rope = &self.documents[tab].buffer.rope;
-                                    self.search
-                                        .find(SearchConfig::case_insensitive(&pat), rope);
+                                    self.search.find(cfg.clone(), rope);
                                     let Some(m) = self.search.current().cloned() else {
                                         self.status_message = Some("No match".into());
                                         return;
                                     };
                                     self.documents[tab].replace_char_range(m.start, m.end, &repl);
                                     let rope = &self.documents[tab].buffer.rope;
-                                    self.search
-                                        .find(SearchConfig::case_insensitive(&pat), rope);
+                                    self.search.find(cfg, rope);
                                     if let Some(nm) = self.search.current().cloned() {
                                         let doc = &mut self.documents[tab];
                                         let line = doc.buffer.char_to_line(nm.start);
@@ -1148,76 +1361,107 @@ impl App {
                 self.modal = None;
                 return;
             }
+            KeyCode::Char(' ') => {
+                if matches!(modal_kind, ModalKind::Find | ModalKind::FindReplace) {
+                    if let Some(m) = self.modal.as_mut() {
+                        let on_find_row = modal_kind == ModalKind::Find
+                            || m.find_replace_focus == FindReplaceFocus::Find;
+                        if on_find_row && !m.find_query_focused() {
+                            match m.find_bar_focus {
+                                FindBarFocus::ToggleCase => {
+                                    m.match_case = !m.match_case;
+                                }
+                                FindBarFocus::ToggleWord => {
+                                    m.whole_word = !m.whole_word;
+                                }
+                                FindBarFocus::ToggleRegex => {
+                                    m.use_regex = !m.use_regex;
+                                }
+                                FindBarFocus::Close => {
+                                    self.modal = None;
+                                    return;
+                                }
+                                FindBarFocus::Prev => {
+                                    self.modal_find_prev();
+                                    return;
+                                }
+                                FindBarFocus::Next => {
+                                    self.modal_find_next();
+                                    return;
+                                }
+                                FindBarFocus::Query => {}
+                            }
+                            if matches!(
+                                m.find_bar_focus,
+                                FindBarFocus::ToggleCase
+                                    | FindBarFocus::ToggleWord
+                                    | FindBarFocus::ToggleRegex
+                            ) {
+                                self.apply_find_from_modal(true);
+                                self.find_bar_anim_frames = 4;
+                                return;
+                            }
+                        }
+                    }
+                }
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.insert_char(' ');
+                }
+                if modal_kind == ModalKind::FindReplace {
+                    let fr = self
+                        .modal
+                        .as_ref()
+                        .map(|m| m.find_replace_focus)
+                        .unwrap_or(FindReplaceFocus::Find);
+                    if fr == FindReplaceFocus::Find {
+                        self.apply_find_from_modal(false);
+                    }
+                } else if modal_kind == ModalKind::Find {
+                    self.apply_find_from_modal(false);
+                }
+            }
             KeyCode::Char(c) => {
-                let fr_focus = self
-                    .modal
-                    .as_ref()
-                    .map(|m| m.find_replace_focus)
-                    .unwrap_or(FindReplaceFocus::Find);
                 if let Some(modal) = self.modal.as_mut() {
                     modal.insert_char(c);
                 }
-                if modal_kind == ModalKind::Find
-                    || (modal_kind == ModalKind::FindReplace && fr_focus == FindReplaceFocus::Find)
-                {
-                    if let Some(modal) = self.modal.as_ref() {
-                        live_find(&mut self.search, modal, tab, &self.documents);
+                if modal_kind == ModalKind::FindReplace {
+                    let fr = self
+                        .modal
+                        .as_ref()
+                        .map(|m| m.find_replace_focus)
+                        .unwrap_or(FindReplaceFocus::Find);
+                    if fr == FindReplaceFocus::Find {
+                        self.apply_find_from_modal(false);
                     }
+                } else if modal_kind == ModalKind::Find {
+                    self.apply_find_from_modal(false);
                 }
             }
             KeyCode::Backspace => {
-                let fr_focus = self
-                    .modal
-                    .as_ref()
-                    .map(|m| m.find_replace_focus)
-                    .unwrap_or(FindReplaceFocus::Find);
                 if let Some(modal) = self.modal.as_mut() {
                     modal.backspace();
                 }
-                if modal_kind == ModalKind::Find
-                    || (modal_kind == ModalKind::FindReplace && fr_focus == FindReplaceFocus::Find)
-                {
-                    if let Some(modal) = self.modal.as_ref() {
-                        live_find(&mut self.search, modal, tab, &self.documents);
+                if modal_kind == ModalKind::FindReplace {
+                    let fr = self
+                        .modal
+                        .as_ref()
+                        .map(|m| m.find_replace_focus)
+                        .unwrap_or(FindReplaceFocus::Find);
+                    if fr == FindReplaceFocus::Find {
+                        self.apply_find_from_modal(false);
                     }
+                } else if modal_kind == ModalKind::Find {
+                    self.apply_find_from_modal(false);
                 }
             }
             KeyCode::Left => {
-                if let Some(modal) = self.modal.as_mut() {
-                    modal.cursor_left();
-                }
+                self.modal_chrome_left_right(false);
             }
             KeyCode::Right => {
-                if let Some(modal) = self.modal.as_mut() {
-                    modal.cursor_right();
-                }
+                self.modal_chrome_left_right(true);
             }
             _ => {}
         }
-    }
-
-    /// Execute a search across the current document.
-    fn execute_search(&mut self, pattern: &str) {
-        let tab = self.active_tab;
-        let rope = &self.documents[tab].buffer.rope;
-        self.search.find(SearchConfig::case_insensitive(pattern), rope);
-
-        // Jump to first match
-        if let Some(m) = self.search.current().cloned() {
-            let doc = &mut self.documents[tab];
-            let line = doc.buffer.char_to_line(m.start);
-            let line_start = doc.buffer.line_to_char(line);
-            let col = m.start - line_start;
-            doc.cursor.goto(line, col, &doc.buffer);
-            doc.ensure_cursor_visible(self.viewport_height, self.viewport_width);
-        }
-
-        let count = self.search.match_count();
-        self.status_message = Some(if count > 0 {
-            format!("{} match{}", count, if count == 1 { "" } else { "es" })
-        } else {
-            "No matches".to_string()
-        });
     }
 
     /// Handle mouse events.
@@ -1323,10 +1567,12 @@ impl App {
             self.ghost_suggestion.as_deref()
         };
         let completion_dropdown = self.completion_list.as_ref().map(|c| (c.items.as_slice(), c.selected));
+        let show_match_strip = self.search.match_count() > 0;
         frame.render_widget(
             EditorPane::new(doc, &self.theme, hl, &self.search)
                 .ghost_text(ghost_text)
-                .completion_dropdown(completion_dropdown),
+                .completion_dropdown(completion_dropdown)
+                .match_strip(show_match_strip),
             editor_area,
         );
 
@@ -1334,12 +1580,14 @@ impl App {
         if let Some(ref modal) = self.modal {
             let search_status =
                 if modal.kind == ModalKind::Find || modal.kind == ModalKind::FindReplace {
-                    Some(self.search.status_text())
+                    Some(self.search.find_bar_status())
                 } else {
                     None
                 };
             frame.render_widget(
-                ModalWidget::new(modal, &self.theme).search_status(search_status),
+                ModalWidget::new(modal, &self.theme)
+                    .search_status(search_status)
+                    .find_bar_anim(self.find_bar_anim_frames),
                 editor_area,
             );
         }
@@ -1355,11 +1603,12 @@ impl App {
         }
 
         // Status bar
-        let search_status = if self.search.match_count() > 0 {
-            Some(self.search.status_text())
-        } else {
-            None
-        };
+        let search_status =
+            if self.search.match_count() > 0 || self.search.last_error.is_some() {
+                Some(self.search.find_bar_status())
+            } else {
+                None
+            };
         let doc = &self.documents[self.active_tab];
         let mut status = StatusBar::new(doc, &self.theme)
             .search_status(search_status)

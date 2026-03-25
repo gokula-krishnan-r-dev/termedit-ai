@@ -46,6 +46,9 @@ pub struct UiColors {
     pub ai_response_bg: Color,
     pub search_match_bg: Color,
     pub search_current_bg: Color,
+    pub find_bar_bg: Color,
+    pub find_toggle_on_bg: Color,
+    pub find_toggle_off_fg: Color,
 }
 
 /// Git status colors.
@@ -89,6 +92,9 @@ struct UiToml {
     ai_response_bg: Option<String>,
     search_match_bg: Option<String>,
     search_current_bg: Option<String>,
+    find_bar_bg: Option<String>,
+    find_toggle_on_bg: Option<String>,
+    find_toggle_off_fg: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +162,9 @@ impl Theme {
             ai_response_bg: None,
             search_match_bg: None,
             search_current_bg: None,
+            find_bar_bg: None,
+            find_toggle_on_bg: None,
+            find_toggle_off_fg: None,
         });
 
         let git_toml = parsed.git.unwrap_or(GitToml {
@@ -213,6 +222,15 @@ impl Theme {
                     &ui_toml.search_current_bg,
                     Color::Rgb(120, 100, 20),
                 ),
+                find_bar_bg: color_or(&ui_toml.find_bar_bg, Color::Rgb(45, 45, 48)),
+                find_toggle_on_bg: color_or(
+                    &ui_toml.find_toggle_on_bg,
+                    Color::Rgb(0, 122, 204),
+                ),
+                find_toggle_off_fg: color_or(
+                    &ui_toml.find_toggle_off_fg,
+                    Color::Rgb(150, 150, 150),
+                ),
             },
             git: GitColors {
                 added: color_or(&git_toml.added, Color::Rgb(78, 201, 176)),
@@ -261,6 +279,9 @@ impl Theme {
                 ai_response_bg: Color::Rgb(37, 37, 38),
                 search_match_bg: Color::Rgb(81, 69, 16),
                 search_current_bg: Color::Rgb(120, 100, 20),
+                find_bar_bg: Color::Rgb(45, 45, 48),
+                find_toggle_on_bg: Color::Rgb(0, 122, 204),
+                find_toggle_off_fg: Color::Rgb(150, 150, 150),
             },
             git: GitColors {
                 added: Color::Rgb(78, 201, 176),
@@ -309,6 +330,9 @@ impl Theme {
                 ai_response_bg: Color::Rgb(33, 37, 43),
                 search_match_bg: Color::Rgb(72, 56, 0),
                 search_current_bg: Color::Rgb(100, 80, 10),
+                find_bar_bg: Color::Rgb(40, 44, 52),
+                find_toggle_on_bg: Color::Rgb(97, 175, 239),
+                find_toggle_off_fg: Color::Rgb(106, 110, 120),
             },
             git: GitColors {
                 added: Color::Rgb(152, 195, 121),
@@ -357,6 +381,9 @@ impl Theme {
                 ai_response_bg: Color::Rgb(24, 24, 37),
                 search_match_bg: Color::Rgb(69, 60, 20),
                 search_current_bg: Color::Rgb(100, 90, 30),
+                find_bar_bg: Color::Rgb(36, 39, 58),
+                find_toggle_on_bg: Color::Rgb(137, 180, 250),
+                find_toggle_off_fg: Color::Rgb(148, 153, 178),
             },
             git: GitColors {
                 added: Color::Rgb(166, 227, 161),

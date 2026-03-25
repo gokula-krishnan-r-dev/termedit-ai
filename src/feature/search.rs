@@ -1,5 +1,7 @@
 /// Find and replace with regex support.
 
+use std::collections::HashSet;
+
 use regex::Regex;
 use ropey::Rope;
 
@@ -57,6 +59,10 @@ pub struct Search {
     pub current_match: Option<usize>,
     /// The active search configuration.
     pub config: Option<SearchConfig>,
+    /// Line indices (0-based) that contain at least one match (for minimap strip).
+    pub match_lines: HashSet<usize>,
+    /// Last regex compile error, if any.
+    pub last_error: Option<String>,
 }
 
 impl Search {
@@ -66,6 +72,8 @@ impl Search {
             matches: Vec::new(),
             current_match: None,
             config: None,
+            match_lines: HashSet::new(),
+            last_error: None,
         }
     }
 
@@ -73,6 +81,8 @@ impl Search {
     pub fn find(&mut self, config: SearchConfig, rope: &Rope) -> &[SearchMatch] {
         self.matches.clear();
         self.current_match = None;
+        self.match_lines.clear();
+        self.last_error = None;
 
         if config.pattern.is_empty() {
             self.config = Some(config);
@@ -81,13 +91,17 @@ impl Search {
 
         if config.is_regex {
             let text = rope.to_string();
-            self.find_regex(&config, &text);
+            self.find_regex(&config, rope, &text);
         } else {
             self.find_literal_rope(&config, rope);
         }
 
         if !self.matches.is_empty() {
             self.current_match = Some(0);
+            for m in &self.matches {
+                let line = rope.char_to_line(m.start);
+                self.match_lines.insert(line);
+            }
         }
 
         self.config = Some(config);
@@ -189,26 +203,35 @@ impl Search {
         }
     }
 
-    /// Find regex matches.
-    fn find_regex(&mut self, config: &SearchConfig, text: &str) {
+    /// Find regex matches (`text` must be `rope.to_string()`; indices are rope char indices).
+    fn find_regex(&mut self, config: &SearchConfig, rope: &Rope, text: &str) {
         let regex_pattern = if config.case_sensitive {
             config.pattern.clone()
         } else {
             format!("(?i){}", config.pattern)
         };
 
-        let Ok(re) = Regex::new(&regex_pattern) else {
-            return; // Invalid regex, return empty
+        let re = match Regex::new(&regex_pattern) {
+            Ok(r) => r,
+            Err(e) => {
+                self.last_error = Some(format!("Invalid regex: {}", e));
+                return;
+            }
         };
 
         for mat in re.find_iter(text) {
             let char_start = text[..mat.start()].chars().count();
-            let char_end = char_start + mat.as_str().chars().count();
+            let matched = mat.as_str();
+            let char_len = matched.chars().count();
+            let char_end = char_start + char_len;
+            if config.whole_word && !self.is_whole_word_rope(rope, char_start, char_len) {
+                continue;
+            }
 
             self.matches.push(SearchMatch {
                 start: char_start,
                 end: char_end,
-                text: mat.as_str().to_string(),
+                text: matched.to_string(),
             });
         }
     }
@@ -260,6 +283,11 @@ impl Search {
             .and_then(|i| self.matches.get(i))
     }
 
+    /// Line index (0-based) of the current match, if any.
+    pub fn current_match_line(&self, rope: &Rope) -> Option<usize> {
+        self.current().map(|m| rope.char_to_line(m.start))
+    }
+
     /// Find the nearest match to a character position.
     pub fn find_nearest(&mut self, char_pos: usize) -> Option<&SearchMatch> {
         if self.matches.is_empty() {
@@ -302,6 +330,17 @@ impl Search {
         self.matches.clear();
         self.current_match = None;
         self.config = None;
+        self.match_lines.clear();
+        self.last_error = None;
+    }
+
+    /// Status line for the find bar (includes regex errors).
+    pub fn find_bar_status(&self) -> String {
+        if let Some(ref e) = self.last_error {
+            let short: String = e.chars().take(40).collect();
+            return short;
+        }
+        self.status_text()
     }
 
     /// Check if a character position falls within any match.
@@ -392,5 +431,39 @@ mod tests {
         search.find(SearchConfig::literal("xyz"), &rope);
         assert_eq!(search.match_count(), 0);
         assert_eq!(search.status_text(), "No results");
+    }
+
+    #[test]
+    fn test_regex_whole_word() {
+        let rope = Rope::from_str("foobaz foo foobar");
+        let mut search = Search::new();
+        search.find(
+            SearchConfig {
+                pattern: "foo".to_string(),
+                is_regex: true,
+                case_sensitive: true,
+                whole_word: true,
+            },
+            &rope,
+        );
+        assert_eq!(search.match_count(), 1);
+        assert_eq!(search.matches[0].text, "foo");
+    }
+
+    #[test]
+    fn test_invalid_regex_sets_error() {
+        let rope = Rope::from_str("hello");
+        let mut search = Search::new();
+        search.find(
+            SearchConfig {
+                pattern: r"(".to_string(),
+                is_regex: true,
+                case_sensitive: true,
+                whole_word: false,
+            },
+            &rope,
+        );
+        assert_eq!(search.match_count(), 0);
+        assert!(search.last_error.is_some());
     }
 }
