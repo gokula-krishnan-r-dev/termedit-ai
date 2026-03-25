@@ -155,6 +155,8 @@ pub struct App {
     #[cfg(feature = "ai")]
     gemini_rx: mpsc::Receiver<(u64, Result<String, gemini_chat::GeminiError>)>,
     #[cfg(feature = "ai")]
+    gemini_request_tx: mpsc::Sender<(u64, GeminiChatRequest)>,
+    #[cfg(feature = "ai")]
     gemini_generation: u64,
     #[cfg(feature = "ssh")]
     pub ssh_context: Option<crate::feature::ssh::SshContext>,

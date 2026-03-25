@@ -222,7 +222,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let mut is_ssh = false;
-    let mut ssh_target = None;
+    let mut ssh_target: Option<String> = None;
     if let Some(SubCommand::Ssh { target }) = &cli.command {
         #[cfg(feature = "ssh")]
         {
