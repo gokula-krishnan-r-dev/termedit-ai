@@ -6,12 +6,32 @@ A terminal text editor (Ratatui + crossterm) aimed at a familiar **VS Code / Cur
 
 ## Quick start
 
+**Fastest setup:** download a release binary for your platform from [GitHub Releases](https://github.com/gokula-krishnan-r-dev/termedit-ai/releases), unpack, and run `./termedit` (or add it to your `PATH`).
+
+**Install from crates.io** (compiles on your machine):
+
 ```bash
-cargo build --release
-# Binary: target/release/termedit
+cargo install termedit
 termedit
 termedit README.md src/main.rs
 ```
+
+Faster compile, smaller dependency graph (no AI HTTP, tree-sitter grammars, or system clipboard):
+
+```bash
+cargo install termedit --no-default-features
+```
+
+Enable subsets, e.g. editor + outline but no AI: `cargo install termedit --no-default-features --features "outline,clipboard"`. Features: `ai`, `outline`, `clipboard`; `full` matches the default set.
+
+**Build from this repo:**
+
+```bash
+cargo build --release
+# target/release/termedit
+```
+
+Release builds use **LTO**, **strip**, and **opt-level 3** for editor performance (see [Cargo.toml](Cargo.toml)).
 
 ---
 

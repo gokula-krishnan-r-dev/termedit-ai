@@ -6,6 +6,7 @@
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "ai")]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -27,14 +28,17 @@ use crate::config::settings::Settings;
 use crate::config::theme::Theme;
 use crate::core::cursor::SelectionMode;
 use crate::core::document::Document;
+#[cfg(feature = "ai")]
 use crate::feature::ai_completion::{self, AiContext};
 use crate::feature::completion;
+#[cfg(feature = "ai")]
 use crate::feature::gemini_chat::{
     self, resolve_chat_model_id, spawn_gemini_worker, ChatRole, GeminiChatRequest, GeminiTurn,
 };
 use crate::feature::search::{search_open_tabs, Search, SearchConfig};
 use crate::feature::session::{self, SessionState};
 use crate::feature::syntax::SyntaxHighlighter;
+#[cfg(feature = "ai")]
 use crate::ui::ai_panel::{AiPanelState, AiPanelWidget};
 use crate::ui::command_palette::{CommandPaletteState, CommandPaletteWidget};
 use crate::ui::editor_pane::EditorPane;
@@ -80,14 +84,12 @@ pub struct App {
     path_prompt_after_save: Option<PathAfterSave>,
     /// Ctrl+P command palette.
     command_palette: CommandPaletteState,
-    /// Ctrl/Cmd+Shift+O symbol outline.
+    /// Ctrl/Cmd+Shift+O symbol outline (empty when built without `outline` feature).
     outline_palette: OutlinePaletteState,
     /// Ctrl/Cmd+Shift+F search across open tabs.
     open_tabs_palette: OpenTabsPaletteState,
     /// Debounce deadline for Find in Open Tabs query scans.
     open_tabs_debounce_at: Option<Instant>,
-    /// Reused buffer when building AI context (reduces allocations).
-    ai_context_before: String,
     /// Editor settings.
     settings: Settings,
     /// Active theme.
@@ -104,23 +106,6 @@ pub struct App {
     viewport_height: usize,
     /// Terminal viewport width.
     viewport_width: usize,
-    /// Inline AI suggestion (ghost text) to show after cursor; Tab accepts.
-    ghost_suggestion: Option<String>,
-    /// Cursor (line, col) when suggestion was computed; clear suggestion if cursor moves line.
-    ghost_trigger_pos: Option<(usize, usize)>,
-    /// Channel to receive AI completion results (generation, suggestion).
-    ai_rx: mpsc::Receiver<(u64, Option<String>)>,
-    ai_tx: mpsc::Sender<(u64, Option<String>)>,
-    /// Channel to send (generation, context) to the single AI worker.
-    ai_request_tx: mpsc::Sender<(u64, AiContext)>,
-    /// Generation ID to ignore stale AI responses.
-    ai_generation: u64,
-    /// When we last edited (for debounced AI request).
-    last_ai_edit: Option<Instant>,
-    /// Generation for which we already sent an AI request.
-    ai_request_sent_for: Option<u64>,
-    /// True when we sent an AI request for current generation and have not yet received a result.
-    ai_pending: bool,
     /// Inline completion dropdown: list of items, selected index, and prefix length for accept.
     completion_list: Option<CompletionList>,
     /// Find bar focus transition frames (non-zero = pulse in UI).
@@ -131,10 +116,45 @@ pub struct App {
     find_pending_config: Option<crate::feature::search::SearchConfig>,
     /// Pair of absolute char indices for bracket highlight (`()`, `[]`, `{}`), or None.
     bracket_highlight: Option<(usize, usize)>,
+    #[cfg(feature = "ai")]
+    /// Reused buffer when building AI context (reduces allocations).
+    ai_context_before: String,
+    #[cfg(feature = "ai")]
+    /// Inline AI suggestion (ghost text) to show after cursor; Tab accepts.
+    ghost_suggestion: Option<String>,
+    #[cfg(feature = "ai")]
+    /// Cursor (line, col) when suggestion was computed; clear suggestion if cursor moves line.
+    ghost_trigger_pos: Option<(usize, usize)>,
+    #[cfg(feature = "ai")]
+    /// Channel to receive AI completion results (generation, suggestion).
+    ai_rx: mpsc::Receiver<(u64, Option<String>)>,
+    /// Kept so the AI worker's channel stays open (worker holds the paired receiver).
+    #[cfg(feature = "ai")]
+    #[allow(dead_code)]
+    ai_tx: mpsc::Sender<(u64, Option<String>)>,
+    #[cfg(feature = "ai")]
+    /// Channel to send (generation, context) to the single AI worker.
+    ai_request_tx: mpsc::Sender<(u64, AiContext)>,
+    #[cfg(feature = "ai")]
+    /// Generation ID to ignore stale AI responses.
+    ai_generation: u64,
+    #[cfg(feature = "ai")]
+    /// When we last edited (for debounced AI request).
+    last_ai_edit: Option<Instant>,
+    #[cfg(feature = "ai")]
+    /// Generation for which we already sent an AI request.
+    ai_request_sent_for: Option<u64>,
+    #[cfg(feature = "ai")]
+    /// True when we sent an AI request for current generation and have not yet received a result.
+    ai_pending: bool,
+    #[cfg(feature = "ai")]
     /// Gemini chat overlay (Ctrl/Cmd+K).
     ai_panel: AiPanelState,
+    #[cfg(feature = "ai")]
     gemini_rx: mpsc::Receiver<(u64, Result<String, gemini_chat::GeminiError>)>,
+    #[cfg(feature = "ai")]
     gemini_request_tx: mpsc::Sender<(u64, GeminiChatRequest)>,
+    #[cfg(feature = "ai")]
     gemini_generation: u64,
 }
 
@@ -151,14 +171,22 @@ impl App {
     pub fn new(settings: Settings, theme: Theme) -> Self {
         let doc = Document::new();
         let hl = SyntaxHighlighter::new(&doc.language);
+        #[cfg(feature = "ai")]
         let (ai_tx, ai_rx) = mpsc::channel();
+        #[cfg(feature = "ai")]
         let (ai_request_tx, ai_request_rx) = mpsc::channel();
+        #[cfg(feature = "ai")]
         let debounce_ms = settings.ai_debounce_ms;
+        #[cfg(feature = "ai")]
         ai_completion::spawn_ai_worker(ai_request_rx, ai_tx.clone(), debounce_ms);
 
+        #[cfg(feature = "ai")]
         let chat_model_id = resolve_chat_model_id(settings.ai_chat_model.as_deref());
+        #[cfg(feature = "ai")]
         let (gemini_tx, gemini_rx) = mpsc::channel();
+        #[cfg(feature = "ai")]
         let (gemini_request_tx, gemini_request_rx) = mpsc::channel();
+        #[cfg(feature = "ai")]
         spawn_gemini_worker(gemini_request_rx, gemini_tx);
 
         Self {
@@ -173,7 +201,6 @@ impl App {
             outline_palette: OutlinePaletteState::new(),
             open_tabs_palette: OpenTabsPaletteState::new(),
             open_tabs_debounce_at: None,
-            ai_context_before: String::new(),
             settings,
             theme,
             show_file_tree: false,
@@ -182,31 +209,74 @@ impl App {
             dirty: true,
             viewport_height: 24,
             viewport_width: 80,
-            ghost_suggestion: None,
-            ghost_trigger_pos: None,
-            ai_rx,
-            ai_tx,
-            ai_request_tx,
-            ai_generation: 0,
-            last_ai_edit: None,
-            ai_request_sent_for: None,
-            ai_pending: false,
             completion_list: None,
             find_bar_anim_frames: 0,
             find_debounce_at: None,
             find_pending_config: None,
             bracket_highlight: None,
+            #[cfg(feature = "ai")]
+            ai_context_before: String::new(),
+            #[cfg(feature = "ai")]
+            ghost_suggestion: None,
+            #[cfg(feature = "ai")]
+            ghost_trigger_pos: None,
+            #[cfg(feature = "ai")]
+            ai_rx,
+            #[cfg(feature = "ai")]
+            ai_tx,
+            #[cfg(feature = "ai")]
+            ai_request_tx,
+            #[cfg(feature = "ai")]
+            ai_generation: 0,
+            #[cfg(feature = "ai")]
+            last_ai_edit: None,
+            #[cfg(feature = "ai")]
+            ai_request_sent_for: None,
+            #[cfg(feature = "ai")]
+            ai_pending: false,
+            #[cfg(feature = "ai")]
             ai_panel: AiPanelState::new(chat_model_id),
+            #[cfg(feature = "ai")]
             gemini_rx,
+            #[cfg(feature = "ai")]
             gemini_request_tx,
+            #[cfg(feature = "ai")]
             gemini_generation: 0,
         }
     }
 
+    /// Clear inline ghost completion state (no-op when built without `ai`).
+    fn clear_ai_inline_state(&mut self) {
+        #[cfg(feature = "ai")]
+        {
+            self.ghost_suggestion = None;
+            self.ghost_trigger_pos = None;
+            self.ai_pending = false;
+        }
+    }
+
+    fn close_ai_panel_overlay(&mut self) {
+        #[cfg(feature = "ai")]
+        self.ai_panel.close();
+    }
+
+    fn ai_panel_is_visible(&self) -> bool {
+        #[cfg(feature = "ai")]
+        {
+            self.ai_panel.visible
+        }
+        #[cfg(not(feature = "ai"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "ai")]
     fn sync_ai_chat_model_setting(&mut self) {
         self.settings.ai_chat_model = Some(self.ai_panel.model_id.clone());
     }
 
+    #[cfg(feature = "ai")]
     fn editor_width_cells(&self) -> u16 {
         let w = self.viewport_width as u16;
         if self.show_file_tree {
@@ -216,6 +286,7 @@ impl App {
         }
     }
 
+    #[cfg(feature = "ai")]
     fn resolve_gemini_api_key(&self) -> Option<String> {
         std::env::var("GEMINI_API_KEY")
             .ok()
@@ -229,6 +300,7 @@ impl App {
             })
     }
 
+    #[cfg(feature = "ai")]
     fn ai_panel_transcript_visible_rows(&self) -> usize {
         let editor_h = self.viewport_height as u16;
         let h = editor_h.saturating_sub(2).min(26).max(10);
@@ -236,6 +308,7 @@ impl App {
         h.saturating_sub(3 + footer_h) as usize
     }
 
+    #[cfg(feature = "ai")]
     fn submit_ai_panel_message(&mut self) {
         let raw = std::mem::take(&mut self.ai_panel.input);
         let trimmed = raw.trim();
@@ -281,6 +354,7 @@ impl App {
         self.dirty = true;
     }
 
+    #[cfg(feature = "ai")]
     fn insert_last_ai_reply_at_cursor(&mut self) {
         let Some(text) = self.ai_panel.last_model_reply().map(str::to_string) else {
             self.status_message = Some("No AI reply to insert.".to_string());
@@ -296,6 +370,7 @@ impl App {
         self.dirty = true;
     }
 
+    #[cfg(feature = "ai")]
     fn handle_ai_panel_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -307,7 +382,7 @@ impl App {
         }
         if matches!(key.code, KeyCode::Char('k')) && (ctrl || super_) {
             self.sync_ai_chat_model_setting();
-            self.ai_panel.close();
+            self.close_ai_panel_overlay();
             self.dirty = true;
             return;
         }
@@ -315,7 +390,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.sync_ai_chat_model_setting();
-                self.ai_panel.close();
+                self.close_ai_panel_overlay();
                 self.dirty = true;
             }
             KeyCode::Enter if !shift => {
@@ -458,9 +533,7 @@ impl App {
             doc.ensure_cursor_visible(vh, vw);
         }
 
-        self.ghost_suggestion = None;
-        self.ghost_trigger_pos = None;
-        self.ai_pending = false;
+        self.clear_ai_inline_state();
         self.completion_list = None;
     }
 
@@ -684,7 +757,7 @@ impl App {
     fn open_find_in_open_tabs_palette(&mut self) {
         self.command_palette.close();
         self.outline_palette.close();
-        self.ai_panel.close();
+        self.close_ai_panel_overlay();
         self.open_tabs_palette.open();
         self.open_tabs_debounce_at = None;
     }
@@ -771,15 +844,13 @@ impl App {
         self.open_tabs_palette.close();
         self.open_tabs_debounce_at = None;
         self.active_tab = hit.tab_index;
+        self.clear_ai_inline_state();
+        self.completion_list = None;
         let doc = &mut self.documents[self.active_tab];
         let line = doc.buffer.char_to_line(hit.match_start);
         let line_start = doc.buffer.line_to_char(line);
         let col = hit.match_start.saturating_sub(line_start);
         doc.cursor.goto(line, col, &doc.buffer);
-        self.ghost_suggestion = None;
-        self.ghost_trigger_pos = None;
-        self.ai_pending = false;
-        self.completion_list = None;
         doc.cursor.clear_selection();
         doc.ensure_cursor_visible(vh, vw);
     }
@@ -815,7 +886,7 @@ impl App {
     fn open_outline_palette(&mut self) {
         self.command_palette.close();
         self.open_tabs_palette.close();
-        self.ai_panel.close();
+        self.close_ai_panel_overlay();
         self.open_tabs_debounce_at = None;
         let tab = self.active_tab;
         let doc = &self.documents[tab];
@@ -851,13 +922,11 @@ impl App {
             return;
         };
         let tab = self.active_tab;
+        self.clear_ai_inline_state();
+        self.completion_list = None;
         let doc = &mut self.documents[tab];
         doc.cursor
             .goto(sym.start_line, sym.name_start_col, &doc.buffer);
-        self.ghost_suggestion = None;
-        self.ghost_trigger_pos = None;
-        self.ai_pending = false;
-        self.completion_list = None;
         doc.ensure_cursor_visible(vh, vw);
     }
 
@@ -925,72 +994,75 @@ impl App {
                 self.dirty = false;
             }
 
-            if self.settings.ai_enabled {
-                while let Ok((gen, suggestion)) = self.ai_rx.try_recv() {
-                    if gen == self.ai_generation {
-                        self.ghost_suggestion = suggestion;
-                        self.ai_pending = false;
-                        self.dirty = true;
+            #[cfg(feature = "ai")]
+            {
+                if self.settings.ai_enabled {
+                    while let Ok((gen, suggestion)) = self.ai_rx.try_recv() {
+                        if gen == self.ai_generation {
+                            self.ghost_suggestion = suggestion;
+                            self.ai_pending = false;
+                            self.dirty = true;
+                        }
                     }
-                }
-                if let Some(last) = self.last_ai_edit {
-                    if last.elapsed() >= Duration::from_millis(self.settings.ai_debounce_ms)
-                        && self.ai_request_sent_for != Some(self.ai_generation)
-                        && !self.documents.is_empty()
-                    {
-                        let tab = self.active_tab;
-                        let doc = &self.documents[tab];
-                        let line = doc.buffer.line_text(doc.cursor.line);
-                        let line_prefix: String = line.chars().take(doc.cursor.col).collect();
-                        let start_line = doc.cursor.line.saturating_sub(30);
-                        self.ai_context_before.clear();
-                        for j in start_line..doc.cursor.line {
-                            if j > start_line {
-                                self.ai_context_before.push('\n');
+                    if let Some(last) = self.last_ai_edit {
+                        if last.elapsed() >= Duration::from_millis(self.settings.ai_debounce_ms)
+                            && self.ai_request_sent_for != Some(self.ai_generation)
+                            && !self.documents.is_empty()
+                        {
+                            let tab = self.active_tab;
+                            let doc = &self.documents[tab];
+                            let line = doc.buffer.line_text(doc.cursor.line);
+                            let line_prefix: String = line.chars().take(doc.cursor.col).collect();
+                            let start_line = doc.cursor.line.saturating_sub(30);
+                            self.ai_context_before.clear();
+                            for j in start_line..doc.cursor.line {
+                                if j > start_line {
+                                    self.ai_context_before.push('\n');
+                                }
+                                self.ai_context_before
+                                    .push_str(&doc.buffer.line_text(j));
                             }
-                            self.ai_context_before
-                                .push_str(&doc.buffer.line_text(j));
+                            let context = AiContext {
+                                line_prefix,
+                                context_before: self.ai_context_before.clone(),
+                                language: doc.language.clone(),
+                                path: doc.buffer.file_path.as_ref().and_then(|p| p.to_str()).map(String::from),
+                                model: self.settings.ai_model.clone(),
+                            };
+                            let _ = self.ai_request_tx.send((self.ai_generation, context));
+                            self.ai_request_sent_for = Some(self.ai_generation);
+                            self.ai_pending = true;
+                            self.dirty = true;
                         }
-                        let context = AiContext {
-                            line_prefix,
-                            context_before: self.ai_context_before.clone(),
-                            language: doc.language.clone(),
-                            path: doc.buffer.file_path.as_ref().and_then(|p| p.to_str()).map(String::from),
-                            model: self.settings.ai_model.clone(),
-                        };
-                        let _ = self.ai_request_tx.send((self.ai_generation, context));
-                        self.ai_request_sent_for = Some(self.ai_generation);
-                        self.ai_pending = true;
-                        self.dirty = true;
                     }
                 }
-            }
 
-            while let Ok((gen, reply)) = self.gemini_rx.try_recv() {
-                if self.ai_panel.pending_req_id == Some(gen) {
-                    self.ai_panel.pending_req_id = None;
-                    self.ai_panel.loading = false;
-                    match reply {
-                        Ok(text) => {
-                            self.ai_panel.turns.push(GeminiTurn {
-                                role: ChatRole::Model,
-                                text,
-                            });
-                            self.ai_panel.error = None;
-                            self.ai_panel.stick_transcript_to_bottom = true;
-                        }
-                        Err(e) => {
-                            self.ai_panel.error = Some(e.to_string());
-                            if let Some(t) = self.ai_panel.turns.pop() {
-                                if matches!(t.role, ChatRole::User) {
-                                    self.ai_panel.input = t.text;
-                                } else {
-                                    self.ai_panel.turns.push(t);
+                while let Ok((gen, reply)) = self.gemini_rx.try_recv() {
+                    if self.ai_panel.pending_req_id == Some(gen) {
+                        self.ai_panel.pending_req_id = None;
+                        self.ai_panel.loading = false;
+                        match reply {
+                            Ok(text) => {
+                                self.ai_panel.turns.push(GeminiTurn {
+                                    role: ChatRole::Model,
+                                    text,
+                                });
+                                self.ai_panel.error = None;
+                                self.ai_panel.stick_transcript_to_bottom = true;
+                            }
+                            Err(e) => {
+                                self.ai_panel.error = Some(e.to_string());
+                                if let Some(t) = self.ai_panel.turns.pop() {
+                                    if matches!(t.role, ChatRole::User) {
+                                        self.ai_panel.input = t.text;
+                                    } else {
+                                        self.ai_panel.turns.push(t);
+                                    }
                                 }
                             }
                         }
+                        self.dirty = true;
                     }
-                    self.dirty = true;
                 }
             }
 
@@ -1013,6 +1085,7 @@ impl App {
                 if self.flush_open_tabs_debounce_if_ready() {
                     tick_dirty = true;
                 }
+                #[cfg(feature = "ai")]
                 if self.ai_panel.visible
                     && (self.ai_panel.loading || self.ai_panel.send_pulse > 0)
                 {
@@ -1037,7 +1110,8 @@ impl App {
                     self.handle_outline_palette_key(key_event);
                 } else if self.command_palette.visible {
                     self.handle_command_palette_key(key_event);
-                } else if self.ai_panel.visible {
+                } else if self.ai_panel_is_visible() {
+                    #[cfg(feature = "ai")]
                     self.handle_ai_panel_key(key_event);
                 } else if self.modal.is_some() {
                     self.handle_modal_key(key_event);
@@ -1057,8 +1131,7 @@ impl App {
                                 let replacement = comp.items[comp.selected].clone();
                                 let prefix_len = comp.prefix_len;
                                 self.completion_list = None;
-                                self.ghost_suggestion = None;
-                                self.ghost_trigger_pos = None;
+                                self.clear_ai_inline_state();
                                 self.documents[self.active_tab].replace_before_cursor(prefix_len, &replacement);
                                 self.dirty = true;
                             } else {
@@ -1209,10 +1282,13 @@ impl App {
                 }
                 doc.insert_char(ch);
                 if self.settings.ai_enabled {
-                    self.ghost_trigger_pos = Some((doc.cursor.line, doc.cursor.col));
-                    self.last_ai_edit = Some(Instant::now());
-                    self.ai_generation = self.ai_generation.wrapping_add(1);
-                    self.ghost_suggestion = completion::suggest(doc);
+                    #[cfg(feature = "ai")]
+                    {
+                        self.ghost_trigger_pos = Some((doc.cursor.line, doc.cursor.col));
+                        self.last_ai_edit = Some(Instant::now());
+                        self.ai_generation = self.ai_generation.wrapping_add(1);
+                        self.ghost_suggestion = completion::suggest(doc);
+                    }
                 }
                 if let Some((items, prefix_len)) = completion::suggest_list(doc) {
                     self.completion_list = Some(CompletionList { items, selected: 0, prefix_len });
@@ -1228,10 +1304,17 @@ impl App {
                 doc.insert_char('\n');
             }
             Action::InsertTab => {
-                if let Some(text) = self.ghost_suggestion.take() {
+                #[cfg(feature = "ai")]
+                let consumed_ghost = if let Some(text) = self.ghost_suggestion.take() {
                     self.ghost_trigger_pos = None;
                     self.documents[tab].insert_text(&text);
+                    true
                 } else {
+                    false
+                };
+                #[cfg(not(feature = "ai"))]
+                let consumed_ghost = false;
+                if !consumed_ghost {
                     let doc = &mut self.documents[tab];
                     if doc.cursor.has_selection() {
                         doc.indent(tab_size);
@@ -1251,10 +1334,13 @@ impl App {
                     doc.backspace();
                 }
                 if self.settings.ai_enabled {
-                    self.ghost_trigger_pos = Some((doc.cursor.line, doc.cursor.col));
-                    self.last_ai_edit = Some(Instant::now());
-                    self.ai_generation = self.ai_generation.wrapping_add(1);
-                    self.ghost_suggestion = completion::suggest(doc);
+                    #[cfg(feature = "ai")]
+                    {
+                        self.ghost_trigger_pos = Some((doc.cursor.line, doc.cursor.col));
+                        self.last_ai_edit = Some(Instant::now());
+                        self.ai_generation = self.ai_generation.wrapping_add(1);
+                        self.ghost_suggestion = completion::suggest(doc);
+                    }
                 }
                 if let Some((items, prefix_len)) = completion::suggest_list(doc) {
                     self.completion_list = Some(CompletionList { items, selected: 0, prefix_len });
@@ -1270,10 +1356,13 @@ impl App {
                     doc.delete_char();
                 }
                 if self.settings.ai_enabled {
-                    self.ghost_trigger_pos = Some((doc.cursor.line, doc.cursor.col));
-                    self.last_ai_edit = Some(Instant::now());
-                    self.ai_generation = self.ai_generation.wrapping_add(1);
-                    self.ghost_suggestion = completion::suggest(doc);
+                    #[cfg(feature = "ai")]
+                    {
+                        self.ghost_trigger_pos = Some((doc.cursor.line, doc.cursor.col));
+                        self.last_ai_edit = Some(Instant::now());
+                        self.ai_generation = self.ai_generation.wrapping_add(1);
+                        self.ghost_suggestion = completion::suggest(doc);
+                    }
                 }
                 if let Some((items, prefix_len)) = completion::suggest_list(doc) {
                     self.completion_list = Some(CompletionList { items, selected: 0, prefix_len });
@@ -1311,33 +1400,50 @@ impl App {
 
             // === Clipboard ===
             Action::Copy => {
-                let doc = &self.documents[tab];
-                if let Some(text) = doc.cursor.selected_text(&doc.buffer) {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        let _ = clipboard.set_text(text);
-                        self.status_message = Some("Copied".to_string());
+                #[cfg(feature = "clipboard")]
+                {
+                    let doc = &self.documents[tab];
+                    if let Some(text) = doc.cursor.selected_text(&doc.buffer) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(text);
+                            self.status_message = Some("Copied".to_string());
+                        }
                     }
+                }
+                #[cfg(not(feature = "clipboard"))]
+                {
+                    self.status_message = Some("Clipboard unsupported in this build.".to_string());
                 }
             }
             Action::Cut => {
-                let doc = &self.documents[tab];
-                if let Some(text) = doc.cursor.selected_text(&doc.buffer) {
-                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                        let _ = clipboard.set_text(text);
+                #[cfg(feature = "clipboard")]
+                {
+                    let doc = &self.documents[tab];
+                    if let Some(text) = doc.cursor.selected_text(&doc.buffer) {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(text);
+                        }
                     }
                 }
                 self.documents[tab].delete_selection();
                 self.status_message = Some("Cut".to_string());
             }
             Action::Paste => {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    if let Ok(text) = clipboard.get_text() {
-                        let doc = &mut self.documents[tab];
-                        if doc.cursor.has_selection() {
-                            doc.delete_selection();
+                #[cfg(feature = "clipboard")]
+                {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(text) = clipboard.get_text() {
+                            let doc = &mut self.documents[tab];
+                            if doc.cursor.has_selection() {
+                                doc.delete_selection();
+                            }
+                            doc.insert_text(&text);
                         }
-                        doc.insert_text(&text);
                     }
+                }
+                #[cfg(not(feature = "clipboard"))]
+                {
+                    self.status_message = Some("Clipboard unsupported in this build.".to_string());
                 }
             }
 
@@ -1354,9 +1460,7 @@ impl App {
                 }
             }
             Action::SaveAs => {
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
+                self.clear_ai_inline_state();
                 self.completion_list = None;
                 self.path_prompt_after_save = None;
                 self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
@@ -1374,9 +1478,7 @@ impl App {
                     if is_modified {
                         let name = self.documents[tab].display_name();
                         self.save_confirm_pending = Some(SaveConfirmPending::CloseTab(tab));
-                        self.ghost_suggestion = None;
-                        self.ghost_trigger_pos = None;
-                        self.ai_pending = false;
+                        self.clear_ai_inline_state();
                         self.completion_list = None;
                         self.modal = Some(ModalState::save_confirm(&name));
                     } else {
@@ -1391,28 +1493,22 @@ impl App {
                 } else {
                     let name = self.documents[tab].display_name();
                     self.save_confirm_pending = Some(SaveConfirmPending::CloseTab(tab));
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                     self.modal = Some(ModalState::save_confirm(&name));
                 }
             }
             Action::OpenFile => {
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
+                self.clear_ai_inline_state();
                 self.completion_list = None;
                 self.modal = Some(ModalState::prompt_path(PathPromptMode::Open));
             }
 
             // === Search ===
             Action::Find => {
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
+                self.clear_ai_inline_state();
                 self.completion_list = None;
-                self.ai_panel.close();
+                self.close_ai_panel_overlay();
                 self.open_tabs_palette.close();
                 self.open_tabs_debounce_at = None;
                 if let Some(ref mut m) = self.modal {
@@ -1427,11 +1523,9 @@ impl App {
                 }
             }
             Action::FindReplace => {
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
+                self.clear_ai_inline_state();
                 self.completion_list = None;
-                self.ai_panel.close();
+                self.close_ai_panel_overlay();
                 self.open_tabs_palette.close();
                 self.open_tabs_debounce_at = None;
                 self.modal = Some(ModalState::find_replace());
@@ -1443,9 +1537,7 @@ impl App {
                             .to_string(),
                     );
                 } else {
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                     if self.open_tabs_palette.visible {
                         self.open_tabs_palette.close();
@@ -1474,11 +1566,9 @@ impl App {
                 }
             }
             Action::GoToLine => {
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
+                self.clear_ai_inline_state();
                 self.completion_list = None;
-                self.ai_panel.close();
+                self.close_ai_panel_overlay();
                 self.outline_palette.close();
                 self.open_tabs_palette.close();
                 self.open_tabs_debounce_at = None;
@@ -1489,9 +1579,7 @@ impl App {
                     self.status_message =
                         Some("Go to Symbol is disabled (outline_enabled = false).".to_string());
                 } else {
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                     if self.outline_palette.visible {
                         self.outline_palette.close();
@@ -1505,9 +1593,7 @@ impl App {
             }
             Action::EscapeSearch => {
                 self.search.clear();
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
+                self.clear_ai_inline_state();
                 self.completion_list = None;
             }
 
@@ -1516,43 +1602,64 @@ impl App {
                 self.show_file_tree = !self.show_file_tree;
             }
             Action::ToggleAiPanel => {
-                if !self.settings.ai_enabled {
-                    self.status_message =
-                        Some("AI is disabled for this run (see --no-ai or ai_enabled).".to_string());
-                } else if self.ai_panel.visible {
-                    self.sync_ai_chat_model_setting();
-                    self.ai_panel.close();
-                } else {
-                    self.command_palette.close();
-                    self.outline_palette.close();
-                    self.open_tabs_palette.close();
-                    self.open_tabs_debounce_at = None;
-                    self.ai_panel.open();
+                #[cfg(not(feature = "ai"))]
+                {
+                    self.status_message = Some(
+                        "This build was compiled without AI. Install with: cargo install termedit --features ai"
+                            .to_string(),
+                    );
+                }
+                #[cfg(feature = "ai")]
+                {
+                    if !self.settings.ai_enabled {
+                        self.status_message =
+                            Some("AI is disabled for this run (see --no-ai or ai_enabled).".to_string());
+                    } else if self.ai_panel.visible {
+                        self.sync_ai_chat_model_setting();
+                        self.close_ai_panel_overlay();
+                    } else {
+                        self.command_palette.close();
+                        self.outline_palette.close();
+                        self.open_tabs_palette.close();
+                        self.open_tabs_debounce_at = None;
+                        self.ai_panel.open();
+                    }
                 }
             }
             Action::AiInsertLastReply => {
+                #[cfg(feature = "ai")]
                 if self.ai_panel.visible {
                     self.insert_last_ai_reply_at_cursor();
                 }
             }
             Action::AiBrainstorm => {
-                if !self.settings.ai_enabled {
-                    self.status_message =
-                        Some("AI is disabled for this run (see --no-ai or ai_enabled).".to_string());
-                } else {
-                    self.command_palette.close();
-                    self.outline_palette.close();
-                    self.open_tabs_palette.close();
-                    self.open_tabs_debounce_at = None;
-                    let tab = self.active_tab;
-                    let doc = &self.documents[tab];
-                    let file_display = doc.display_name().to_string();
-                    let language = doc.language.clone();
-                    self.ai_panel.open();
-                    self.ai_panel.input =
-                        gemini_chat::brainstorm_user_prompt(&file_display, &language);
-                    self.ai_panel.error = None;
-                    self.ai_panel.stick_transcript_to_bottom = true;
+                #[cfg(not(feature = "ai"))]
+                {
+                    self.status_message = Some(
+                        "This build was compiled without AI. Install with: cargo install termedit --features ai"
+                            .to_string(),
+                    );
+                }
+                #[cfg(feature = "ai")]
+                {
+                    if !self.settings.ai_enabled {
+                        self.status_message =
+                            Some("AI is disabled for this run (see --no-ai or ai_enabled).".to_string());
+                    } else {
+                        self.command_palette.close();
+                        self.outline_palette.close();
+                        self.open_tabs_palette.close();
+                        self.open_tabs_debounce_at = None;
+                        let tab = self.active_tab;
+                        let doc = &self.documents[tab];
+                        let file_display = doc.display_name().to_string();
+                        let language = doc.language.clone();
+                        self.ai_panel.open();
+                        self.ai_panel.input =
+                            gemini_chat::brainstorm_user_prompt(&file_display, &language);
+                        self.ai_panel.error = None;
+                        self.ai_panel.stick_transcript_to_bottom = true;
+                    }
                 }
             }
             Action::CommandPalette => {
@@ -1562,7 +1669,7 @@ impl App {
                     self.outline_palette.close();
                     self.open_tabs_palette.close();
                     self.open_tabs_debounce_at = None;
-                    self.ai_panel.close();
+                    self.close_ai_panel_overlay();
                     self.command_palette.open();
                 }
             }
@@ -1571,9 +1678,7 @@ impl App {
             Action::NextTab => {
                 if !self.documents.is_empty() {
                     self.active_tab = (self.active_tab + 1) % self.documents.len();
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                 }
             }
@@ -1584,9 +1689,7 @@ impl App {
                     } else {
                         self.active_tab - 1
                     };
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                 }
             }
@@ -1594,9 +1697,7 @@ impl App {
                 if !self.documents.is_empty() {
                     let idx = idx.min(self.documents.len().saturating_sub(1));
                     self.active_tab = idx;
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                 }
             }
@@ -1606,9 +1707,7 @@ impl App {
                 let has_unsaved = self.documents.iter().any(|d| d.is_modified());
                 if has_unsaved {
                     self.save_confirm_pending = Some(SaveConfirmPending::Quit);
-                    self.ghost_suggestion = None;
-                    self.ghost_trigger_pos = None;
-                    self.ai_pending = false;
+                    self.clear_ai_inline_state();
                     self.completion_list = None;
                     self.modal = Some(ModalState::save_confirm("unsaved files"));
                 } else {
@@ -1625,12 +1724,13 @@ impl App {
         self.sync_bracket_highlight();
 
         // Invalidate ghost suggestion when cursor moved to another line
-        if let Some((trigger_line, _)) = self.ghost_trigger_pos {
-            if self.documents[self.active_tab].cursor.line != trigger_line {
-                self.ghost_suggestion = None;
-                self.ghost_trigger_pos = None;
-                self.ai_pending = false;
-                self.completion_list = None;
+        #[cfg(feature = "ai")]
+        {
+            if let Some((trigger_line, _)) = self.ghost_trigger_pos {
+                if self.documents[self.active_tab].cursor.line != trigger_line {
+                    self.clear_ai_inline_state();
+                    self.completion_list = None;
+                }
             }
         }
 
@@ -2211,10 +2311,19 @@ impl App {
         // Editor pane
         let doc = &self.documents[self.active_tab];
         let hl = &self.highlighters[self.active_tab];
-        let ghost_text = if self.ai_pending && self.ghost_suggestion.is_none() {
-            Some("...")
-        } else {
-            self.ghost_suggestion.as_deref()
+        let ghost_text: Option<&str> = {
+            #[cfg(feature = "ai")]
+            {
+                if self.ai_pending && self.ghost_suggestion.is_none() {
+                    Some("...")
+                } else {
+                    self.ghost_suggestion.as_deref()
+                }
+            }
+            #[cfg(not(feature = "ai"))]
+            {
+                None
+            }
         };
         let completion_dropdown = self.completion_list.as_ref().map(|c| (c.items.as_slice(), c.selected));
         let show_match_strip = self.search.match_count() > 0;
@@ -2274,6 +2383,7 @@ impl App {
             );
         }
 
+        #[cfg(feature = "ai")]
         if self.ai_panel.visible {
             frame.render_widget(
                 AiPanelWidget {

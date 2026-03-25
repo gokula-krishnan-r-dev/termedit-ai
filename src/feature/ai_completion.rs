@@ -6,6 +6,7 @@
 use serde::Serialize;
 use std::sync::mpsc;
 use std::thread;
+#[cfg(feature = "ai")]
 use std::time::{Duration, Instant};
 
 const API_URL: &str = "https://auto-comment.gokulakrishnanr812-492.workers.dev/";
@@ -86,8 +87,9 @@ fn strip_overlap(line_prefix: &str, suggestion: &str) -> String {
     suggestion.to_string()
 }
 
-/// Call the API with a shared client (blocking). Returns the completion suffix or None on error.
-fn fetch_with_client(client: &reqwest::blocking::Client, context: AiContext) -> Option<String> {
+/// Call the API with a shared HTTP agent (blocking). Returns the completion suffix or None on error.
+#[cfg(feature = "ai")]
+fn fetch_with_agent(agent: &ureq::Agent, context: AiContext) -> Option<String> {
     let lang_note = if context.language.is_empty() || context.language == "text" {
         String::new()
     } else {
@@ -147,17 +149,19 @@ fn fetch_with_client(client: &reqwest::blocking::Client, context: AiContext) -> 
         skip_cache: false,
     };
 
-    let resp = client
+    let resp = agent
         .post(API_URL)
-        .json(&body)
-        .send()
+        .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .send_json(&body)
         .ok()?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if status < 200 || status >= 300 {
         return None;
     }
 
-    let value: serde_json::Value = resp.json().ok()?;
+    let body_str = resp.into_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body_str).ok()?;
     let raw = extract_completion(&value)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -174,19 +178,14 @@ fn fetch_with_client(client: &reqwest::blocking::Client, context: AiContext) -> 
 
 /// Spawn the single long-lived AI worker: one shared HTTP client, debounce inside the worker.
 /// Receives (generation, context) on request_rx; after debounce_ms since last request, fetches and sends (generation, result) on result_tx.
+#[cfg(feature = "ai")]
 pub fn spawn_ai_worker(
     request_rx: mpsc::Receiver<(u64, AiContext)>,
     result_tx: mpsc::Sender<(u64, Option<String>)>,
     debounce_ms: u64,
 ) {
     thread::spawn(move || {
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        let agent = ureq::Agent::new();
         let debounce = Duration::from_millis(debounce_ms);
         let recv_timeout = Duration::from_millis(50);
         let mut pending: Option<(u64, AiContext)> = None;
@@ -203,12 +202,23 @@ pub fn spawn_ai_worker(
             }
             if let Some((gen, ctx)) = pending.take() {
                 if last_received.elapsed() >= debounce {
-                    let result = fetch_with_client(&client, ctx);
+                    let result = fetch_with_agent(&agent, ctx);
                     let _ = result_tx.send((gen, result));
                 } else {
                     pending = Some((gen, ctx));
                 }
             }
         }
+    });
+}
+
+#[cfg(not(feature = "ai"))]
+pub fn spawn_ai_worker(
+    request_rx: mpsc::Receiver<(u64, AiContext)>,
+    _result_tx: mpsc::Sender<(u64, Option<String>)>,
+    _debounce_ms: u64,
+) {
+    thread::spawn(move || {
+        while request_rx.recv().is_ok() {}
     });
 }

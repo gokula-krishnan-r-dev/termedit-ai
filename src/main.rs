@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use clap::Parser;
+#[cfg(feature = "ai")]
 use feature::gemini_chat;
 use feature::git_worktree;
 use feature::session;
@@ -113,8 +114,18 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.list_gemini_models {
-        print!("{}", gemini_chat::models_list_text());
-        return Ok(());
+        #[cfg(feature = "ai")]
+        {
+            print!("{}", gemini_chat::models_list_text());
+            return Ok(());
+        }
+        #[cfg(not(feature = "ai"))]
+        {
+            eprintln!(
+                "termedit: this build was compiled without AI. Use: cargo install termedit --features ai"
+            );
+            return Ok(());
+        }
     }
 
     if cli.print_session {

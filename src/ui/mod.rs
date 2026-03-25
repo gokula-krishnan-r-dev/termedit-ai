@@ -1,3 +1,4 @@
+#[cfg(feature = "ai")]
 pub mod ai_panel;
 pub mod command_palette;
 pub mod editor_pane;

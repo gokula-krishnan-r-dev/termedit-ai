@@ -13,6 +13,11 @@ This document explains how the editor is structured so you can fix bugs, add fea
 | [`src/config/`](../src/config/) | `Settings`, `Theme`, `keymap` (`Action` enum). |
 | [`src/ui/`](../src/ui/) | Ratatui widgets: editor pane, tab bar, modals, command palette, **outline palette**, **open tabs palette** (`open_tabs_palette.rs`), status bar. |
 
+## Cargo features and release profile
+
+- **Features** (see root [`Cargo.toml`](../Cargo.toml)): `ai` (ureq + Gemini / ghost completions), `outline` (tree-sitter + Go to Symbol), `clipboard` (arboard). Defaults enable all three; `--no-default-features` yields the leanest compile.
+- **Release**: `opt-level = 3` with LTO and `strip` balances editor redraw speed vs binary size. Switch to `opt-level = "z"` in `Cargo.toml` if you prefer smallest binaries.
+
 ## File save pipeline
 
 1. **Buffer** ([`buffer.rs`](../src/core/buffer.rs)): `save()` writes to `file_path`; `save_to(path)` creates parent directories with `create_dir_all`, writes bytes (encoding + line endings), then sets `file_path` and clears `modified`.

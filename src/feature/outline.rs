@@ -1,7 +1,5 @@
 //! Go-to-symbol outline: tree-sitter extraction of top-level definitions.
 
-use tree_sitter::{Node, Parser, Point};
-
 /// Kind of outline entry (affects list prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
@@ -48,6 +46,22 @@ pub struct OutlineSymbol {
 
 /// Extract top-level symbols for supported languages. Returns empty when unsupported or on parse failure.
 pub fn extract_symbols(language_id: &str, source: &str) -> Vec<OutlineSymbol> {
+    #[cfg(feature = "outline")]
+    {
+        extract_symbols_inner(language_id, source)
+    }
+    #[cfg(not(feature = "outline"))]
+    {
+        let _ = (language_id, source);
+        Vec::new()
+    }
+}
+
+#[cfg(feature = "outline")]
+use tree_sitter::{Node, Parser, Point};
+
+#[cfg(feature = "outline")]
+fn extract_symbols_inner(language_id: &str, source: &str) -> Vec<OutlineSymbol> {
     let Some(lang) = language_for(language_id) else {
         return Vec::new();
     };
@@ -75,6 +89,7 @@ pub fn extract_symbols(language_id: &str, source: &str) -> Vec<OutlineSymbol> {
     out
 }
 
+#[cfg(feature = "outline")]
 fn language_for(id: &str) -> Option<tree_sitter::Language> {
     Some(match id {
         "rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -87,18 +102,21 @@ fn language_for(id: &str) -> Option<tree_sitter::Language> {
     })
 }
 
+#[cfg(feature = "outline")]
 fn node_name_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     let name = node.child_by_field_name("name")?;
     let t = name.utf8_text(source).ok()?;
     Some(t.to_string())
 }
 
+#[cfg(feature = "outline")]
 fn node_type_text(node: Node<'_>, source: &[u8]) -> Option<String> {
     let t = node.child_by_field_name("type")?;
     let txt = t.utf8_text(source).ok()?;
     Some(txt.to_string())
 }
 
+#[cfg(feature = "outline")]
 fn point_to_line_col(source: &str, point: Point) -> (usize, usize) {
     let row = point.row as usize;
     let byte_col = point.column as usize;
@@ -112,6 +130,7 @@ fn point_to_line_col(source: &str, point: Point) -> (usize, usize) {
     (row, char_col)
 }
 
+#[cfg(feature = "outline")]
 fn nth_line_start_byte(s: &str, line_idx: usize) -> usize {
     let mut line = 0usize;
     for (i, b) in s.as_bytes().iter().enumerate() {
@@ -129,6 +148,7 @@ fn nth_line_start_byte(s: &str, line_idx: usize) -> usize {
     }
 }
 
+#[cfg(feature = "outline")]
 fn line_slice_bytes(s: &str, line_idx: usize) -> &[u8] {
     let start = nth_line_start_byte(s, line_idx);
     let rest = s[start..].as_bytes();
@@ -139,6 +159,7 @@ fn line_slice_bytes(s: &str, line_idx: usize) -> &[u8] {
     &rest[..end_rel]
 }
 
+#[cfg(feature = "outline")]
 fn push_symbol(
     out: &mut Vec<OutlineSymbol>,
     kind: SymbolKind,
@@ -158,6 +179,7 @@ fn push_symbol(
     });
 }
 
+#[cfg(feature = "outline")]
 fn collect_rust_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -206,6 +228,7 @@ fn collect_rust_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     out
 }
 
+#[cfg(feature = "outline")]
 fn collect_python_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -251,6 +274,7 @@ fn collect_python_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol>
     out
 }
 
+#[cfg(feature = "outline")]
 fn collect_js_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -302,6 +326,7 @@ fn collect_js_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     out
 }
 
+#[cfg(feature = "outline")]
 fn collect_ts_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     let mut out = collect_js_top_level(root, source);
     let bytes = source.as_bytes();
@@ -334,6 +359,7 @@ fn collect_ts_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     out
 }
 
+#[cfg(feature = "outline")]
 fn collect_go_top_level(root: &Node<'_>, source: &str) -> Vec<OutlineSymbol> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -376,6 +402,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "outline")]
     fn rust_outline() {
         let src = r#"
 fn alpha() {}
@@ -389,6 +416,7 @@ mod gamma {}
     }
 
     #[test]
+    #[cfg(feature = "outline")]
     fn python_outline() {
         let src = r#"
 def foo():
@@ -402,6 +430,7 @@ class Bar:
     }
 
     #[test]
+    #[cfg(feature = "outline")]
     fn go_outline() {
         let src = r#"
 package main
@@ -414,6 +443,7 @@ type Thing struct { n int }
     }
 
     #[test]
+    #[cfg(feature = "outline")]
     fn typescript_interface() {
         let src = r"interface User { id: number }";
         let sym = extract_symbols("typescript", src);

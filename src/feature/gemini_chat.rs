@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use std::thread;
+#[cfg(feature = "ai")]
 use std::time::Duration;
 
 /// Models offered in the UI and via `--list-gemini-models` / `--ai-chat-model`.
@@ -265,8 +266,9 @@ pub fn extract_response_text(json: &str) -> Result<String, GeminiError> {
     }
 }
 
+#[cfg(feature = "ai")]
 fn generate(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     api_key: &str,
     model_id: &str,
     system_instruction: &str,
@@ -277,51 +279,43 @@ fn generate(
         model_id, api_key
     );
     let body = build_body(system_instruction, turns);
-    let resp = client
+    let resp = agent
         .post(&url)
-        .json(&body)
-        .send()
+        .timeout(Duration::from_secs(API_TIMEOUT_SECS))
+        .send_json(&body)
         .map_err(|e| GeminiError::Network(e.to_string()))?;
 
     let status = resp.status();
     let text = resp
-        .text()
+        .into_string()
         .map_err(|e| GeminiError::Network(e.to_string()))?;
 
-    if !status.is_success() {
+    if status < 200 || status >= 300 {
         if let Ok(v) = serde_json::from_str::<GenerateResponse>(&text) {
             if let Some(err) = v.error {
-                let msg = err.message.unwrap_or_else(|| status.to_string());
-                return Err(GeminiError::Http(status.as_u16(), msg));
+                let msg = err.message.unwrap_or_else(|| format!("HTTP {}", status));
+                return Err(GeminiError::Http(status, msg));
             }
         }
         let msg = text.chars().take(512).collect::<String>();
-        return Err(GeminiError::Http(status.as_u16(), msg));
+        return Err(GeminiError::Http(status, msg));
     }
 
     extract_response_text(&text)
 }
 
+#[cfg(feature = "ai")]
 pub fn spawn_gemini_worker(
     request_rx: mpsc::Receiver<(u64, GeminiChatRequest)>,
     result_tx: mpsc::Sender<(u64, Result<String, GeminiError>)>,
 ) {
     thread::spawn(move || {
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(API_TIMEOUT_SECS))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("gemini client build failed: {}", e);
-                return;
-            }
-        };
+        let agent = ureq::Agent::new();
 
         while let Ok((id, req)) = request_rx.recv() {
             let turns = truncate_turns_for_budget(&req.turns, CHAT_HISTORY_MAX_BYTES);
             let res = generate(
-                &client,
+                &agent,
                 &req.api_key,
                 &req.model_id,
                 &req.system_instruction,
@@ -329,6 +323,16 @@ pub fn spawn_gemini_worker(
             );
             let _ = result_tx.send((id, res));
         }
+    });
+}
+
+#[cfg(not(feature = "ai"))]
+pub fn spawn_gemini_worker(
+    request_rx: mpsc::Receiver<(u64, GeminiChatRequest)>,
+    _result_tx: mpsc::Sender<(u64, Result<String, GeminiError>)>,
+) {
+    thread::spawn(move || {
+        while request_rx.recv().is_ok() {}
     });
 }
 

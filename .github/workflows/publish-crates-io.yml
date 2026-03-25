@@ -2,7 +2,8 @@ name: Publish to crates.io
 
 on:
   push:
-    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -12,7 +13,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check working tree is clean
+        run: git diff --exit-code && git diff --cached --exit-code
+
+      - name: Dry-run package
+        run: cargo publish --dry-run
+
       - name: Publish crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: cargo publish --allow-dirty
+        run: cargo publish
