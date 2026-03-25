@@ -147,14 +147,11 @@ mod tests {
         let llm = MockLlm {
             response: plan_json.to_string(),
         };
-        let dir = tempfile::tempdir().unwrap();
-        let opts = AiServerOptions {
-            api_key: "k".to_string(),
-            model_id: "m".to_string(),
-            cache_dir: Some(dir.path().to_path_buf()),
-            dry_run: true,
-            include_secrets: false,
-        };
-        repl::run_once(&llm, "status?", &opts).await.unwrap();
+        let ctx = ServerContext::empty("test-host".into(), "/tmp".into(), vec![]);
+        let sys = super::prompt::system_instruction_json_only();
+        let user = super::prompt::user_message("status?", &ctx).unwrap();
+        let raw = llm.generate_json(&sys, &user).await.unwrap();
+        let plan = super::response::AssistantPlan::parse_model_text(&raw).unwrap();
+        super::apply::offer_apply_plan(&plan, true).unwrap();
     }
 }

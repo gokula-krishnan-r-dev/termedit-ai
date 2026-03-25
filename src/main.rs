@@ -51,6 +51,12 @@ Examples:
   termedit --ai-server
       (Feature `ai-server`) Interactive DevOps assistant: server context + Gemini REPL.
 
+  termedit logs /var/log/syslog
+      (Feature `logs`) Open the Smart Log Explorer for a log file.
+
+  termedit logs /var/log/nginx/access.log --from-start
+      Scan from beginning of the file instead of tailing.
+
   termedit -- --weird-name.txt
       Open a file whose name starts with '-' (paths after -- are files).
 ";
@@ -127,6 +133,40 @@ struct Cli {
     /// Send literal `.env` values to the model (unsafe; default is REDACTED).
     #[arg(long = "ai-server-include-secrets")]
     ai_server_include_secrets: bool,
+
+    // ── Smart Log Explorer ───────────────────────────────────────────────────
+
+    /// Open the Smart Log Explorer for a log file (requires `logs` feature).
+    /// Usage: termedit logs <FILE>
+    #[command(subcommand)]
+    command: Option<SubCommand>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum SubCommand {
+    /// Real-time, queryable, AI-assisted log viewer.
+    ///
+    /// Examples:
+    ///   termedit logs /var/log/syslog
+    ///   termedit logs app.log --from-start
+    ///   termedit logs /var/log/nginx/access.log --gemini-api-key $KEY
+    Logs {
+        /// Path to the log file to explore.
+        #[arg(value_name = "FILE")]
+        file: String,
+
+        /// Start reading from the beginning instead of the tail.
+        #[arg(long)]
+        from_start: bool,
+
+        /// Gemini API key for AI queries (overrides GEMINI_API_KEY env var).
+        #[arg(long = "gemini-api-key", value_name = "KEY")]
+        gemini_api_key: Option<String>,
+
+        /// Gemini model id for AI analysis (default: gemini-2.5-flash).
+        #[arg(long = "ai-model", value_name = "MODEL")]
+        ai_model: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -135,6 +175,35 @@ fn main() -> anyhow::Result<()> {
 
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    // ── Smart Log Explorer ────────────────────────────────────────────────────
+    if let Some(SubCommand::Logs { file, from_start, gemini_api_key, ai_model }) = cli.command {
+        #[cfg(feature = "logs")]
+        {
+            // Resolve API key: CLI flag → env var → None (AI features disabled).
+            let api_key = gemini_api_key
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok());
+
+            let model_id = ai_model.unwrap_or_else(|| {
+                feature::gemini_chat::default_chat_model_id().to_string()
+            });
+
+            return feature::logs::run(feature::logs::LogsOptions {
+                file,
+                api_key,
+                model_id,
+                from_start,
+            });
+        }
+        #[cfg(not(feature = "logs"))]
+        {
+            eprintln!(
+                "termedit: `termedit logs` requires building with the `logs` feature.\n\
+                 Try: cargo install termedit --features logs"
+            );
+            return Ok(());
+        }
+    }
 
     if cli.ai_server {
         #[cfg(feature = "ai-server")]

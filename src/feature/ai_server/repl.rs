@@ -10,10 +10,6 @@ use super::response::AssistantPlan;
 use super::ui;
 use super::{collect_context, AiServerOptions};
 
-pub struct ReplOptions {
-    pub dry_run: bool,
-}
-
 pub async fn run_repl(llm: &dyn LlmClient, opts: &AiServerOptions) -> Result<()> {
     println!("TermEdit AI server context mode — type a question, or:");
     println!("  /refresh  Rebuild context (ignore cache)");
@@ -51,18 +47,6 @@ pub async fn run_repl(llm: &dyn LlmClient, opts: &AiServerOptions) -> Result<()>
         print_plan(&plan);
         apply::offer_apply_plan(&plan, opts.dry_run)?;
     }
-    Ok(())
-}
-
-/// One-shot query (non-interactive).
-pub async fn run_once(llm: &dyn LlmClient, query: &str, opts: &AiServerOptions) -> Result<()> {
-    let ctx = collect_context(opts, false).await?;
-    let sys = system_instruction_json_only();
-    let user = user_message(query, &ctx)?;
-    let raw = llm.generate_json(&sys, &user).await?;
-    let plan = AssistantPlan::parse_model_text(&raw)?;
-    print_plan(&plan);
-    apply::offer_apply_plan(&plan, opts.dry_run)?;
     Ok(())
 }
 

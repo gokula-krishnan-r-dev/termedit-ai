@@ -57,3 +57,28 @@ async fn parse_env_file(path: &Path, include_secrets: bool) -> Result<Vec<Dotenv
     }
     Ok(v)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn redacts_values_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let envpath = dir.path().join(".env");
+        let mut f = std::fs::File::create(&envpath).unwrap();
+        writeln!(f, "SECRET=hello").unwrap();
+        let mut cfg = CollectConfig::with_cwd(dir.path().to_path_buf());
+        cfg.include_secrets = false;
+        let mut ctx = crate::feature::ai_server::context::ServerContext::empty(
+            "t".into(),
+            dir.path().to_string_lossy().into_owned(),
+            vec![],
+        );
+        contribute(&mut ctx, &cfg).await.unwrap();
+        assert_eq!(ctx.dotenv.len(), 1);
+        assert!(ctx.dotenv[0].raw_redacted.contains("REDACTED"));
+        assert!(!ctx.dotenv[0].raw_redacted.contains("hello"));
+    }
+}

@@ -6,6 +6,8 @@ pub mod gemini_chat;
 pub mod git_worktree;
 pub mod completion;
 pub mod language;
+#[cfg(feature = "logs")]
+pub mod logs;
 pub mod outline;
 pub mod search;
 pub mod session;

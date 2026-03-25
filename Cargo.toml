@@ -1,6 +1,6 @@
 [package]
 name = "termedit"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A modern, nano-style terminal editor with session restore, AI ghost text, and professional shortcuts"
 readme = "README.md"
@@ -17,7 +17,7 @@ exclude = [
 
 [features]
 default = ["ai", "outline", "clipboard"]
-full = ["ai", "outline", "clipboard", "ai-server"]
+full = ["ai", "outline", "clipboard", "ai-server", "logs"]
 ai = ["dep:ureq"]
 ai-server = [
     "ai",
@@ -31,6 +31,12 @@ ai-server = [
     "dep:sha2",
     "dep:diffy",
     "dep:async-trait",
+]
+logs = [
+    "dep:tokio",
+    "dep:chrono",
+    "dep:notify",
+    "dep:ureq",
 ]
 outline = [
     "dep:tree-sitter",
@@ -91,7 +97,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # AI server context mode (optional)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "io-util"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 walkdir = { version = "2", optional = true }
 sysinfo = { version = "0.33", optional = true }
@@ -101,6 +107,10 @@ similar = { version = "2", optional = true }
 sha2 = { version = "0.10", optional = true }
 diffy = { version = "0.4", optional = true }
 async-trait = { version = "0.1", optional = true }
+
+# Smart Log Explorer (optional)
+chrono = { version = "0.4", features = ["serde"], optional = true }
+notify = { version = "6", optional = true }
 
 [profile.release]
 # Size vs speed: "z" minimizes binary size; 3 favors editor redraw throughput. LTO + strip keep releases lean.

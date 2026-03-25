@@ -1,7 +1,6 @@
 use anyhow::Result;
-use sysinfo::{
-    CpuRefreshKind, DiskRefreshKind, ProcessRefreshKind, RefreshKind, System,
-};
+use std::time::Duration;
+use sysinfo::{Disks, System};
 
 use crate::feature::ai_server::context::{DiskMetric, MetricsSnapshot, ProcessMetric, ServerContext};
 
@@ -15,29 +14,21 @@ pub async fn contribute(ctx: &mut ServerContext, config: &CollectConfig) -> Resu
 }
 
 fn collect_sync(top_n: usize) -> Result<MetricsSnapshot> {
-    let mut sys = System::new_with_specifics(
-        RefreshKind::nothing()
-            .with_cpu(CpuRefreshKind::everything())
-            .with_memory()
-            .with_processes(ProcessRefreshKind::nothing().with_cpu().with_memory())
-            .with_disks_list()
-            .with_disks(DiskRefreshKind::everything()),
-    );
-    sys.refresh_all();
-    std::thread::sleep(std::time::Duration::from_millis(150));
+    let mut sys = System::new_all();
+    std::thread::sleep(Duration::from_millis(200));
     sys.refresh_cpu_usage();
 
     let cpus = sys.cpus().len();
-    let total_memory_bytes = sys.total_memory() * 1024;
-    let used_memory_bytes = sys.used_memory() * 1024;
+    let total_memory_bytes = sys.total_memory();
+    let used_memory_bytes = sys.used_memory();
 
     let load_average = System::load_average();
 
+    let disks_list = Disks::new_with_refreshed_list();
     let mut disks = vec![];
-    for d in sys.disks() {
-        let mount = d.mount_point().to_string_lossy().to_string();
+    for d in disks_list.list() {
         disks.push(DiskMetric {
-            mount,
+            mount: d.mount_point().to_string_lossy().to_string(),
             total_bytes: d.total_space(),
             available_bytes: d.available_space(),
         });
@@ -46,13 +37,11 @@ fn collect_sync(top_n: usize) -> Result<MetricsSnapshot> {
     let mut procs: Vec<ProcessMetric> = sys
         .processes()
         .iter()
-        .filter_map(|(pid, p)| {
-            Some(ProcessMetric {
-                pid: pid.as_u32(),
-                name: p.name().to_string_lossy().into_owned(),
-                memory_bytes: p.memory() * 1024,
-                cpu_usage: p.cpu_usage(),
-            })
+        .map(|(pid, p)| ProcessMetric {
+            pid: pid.as_u32(),
+            name: p.name().to_string_lossy().into_owned(),
+            memory_bytes: p.memory(),
+            cpu_usage: p.cpu_usage(),
         })
         .collect();
     procs.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes));

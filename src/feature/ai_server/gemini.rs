@@ -104,7 +104,7 @@ impl LlmClient for GeminiLlm {
     }
 }
 
-/// Test double: returns fixed JSON text.
+/// Test double: returns fixed JSON text (for integration tests / benches).
 pub struct MockLlm {
     pub response: String,
 }

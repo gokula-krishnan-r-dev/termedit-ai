@@ -49,11 +49,11 @@ fn preview_one(edit: &FileEdit) -> Result<()> {
         String::new()
     };
     let new_text = resolved_new_content(&original, edit)?;
-    let diff = TextDiff::from_lines(original.as_str(), new_text.as_str())
-        .unified_diff()
-        .context_radius(3)
-        .header(&edit.path, &edit.path);
-    ui::print_diff(&diff.to_string());
+    let td = TextDiff::from_lines(original.as_str(), new_text.as_str());
+    let mut ud = td.unified_diff();
+    let u = ud.context_radius(3).header(&edit.path, &edit.path);
+    let diff_str = u.to_string();
+    ui::print_diff(&diff_str);
     Ok(())
 }
 
@@ -61,8 +61,10 @@ fn resolved_new_content(original: &str, edit: &FileEdit) -> Result<String> {
     if let Some(full) = &edit.new_content {
         return Ok(full.clone());
     }
-    if let Some(patch) = &edit.unified_diff {
-        return diffy::apply(original, patch).map_err(|e| anyhow::anyhow!("diff apply (preview/build): {}", e));
+    if let Some(patch_str) = &edit.unified_diff {
+        let patch = diffy::Patch::from_str(patch_str.as_str())
+            .map_err(|e| anyhow::anyhow!("invalid unified diff: {}", e))?;
+        return diffy::apply(original, &patch).map_err(|e| anyhow::anyhow!("diff apply: {}", e));
     }
     anyhow::bail!("file_edits entry needs unified_diff or new_content: {}", edit.path);
 }
