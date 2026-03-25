@@ -17,7 +17,7 @@ exclude = [
 
 [features]
 default = ["ai", "outline", "clipboard"]
-full = ["ai", "outline", "clipboard", "ai-server", "logs"]
+full = ["ai", "outline", "clipboard", "ai-server", "logs", "timeline", "ssh"]
 ai = ["dep:ureq"]
 ai-server = [
     "ai",
@@ -38,6 +38,11 @@ logs = [
     "dep:notify",
     "dep:ureq",
 ]
+timeline = [
+    "dep:tokio",
+    "dep:chrono",
+    "dep:similar",
+]
 outline = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
@@ -47,6 +52,13 @@ outline = [
     "dep:tree-sitter-go",
 ]
 clipboard = ["dep:arboard"]
+ssh = [
+    "dep:tokio",
+    "dep:openssh",
+    "dep:openssh-sftp-client",
+    "dep:diffy",
+    "dep:tempfile",
+]
 
 [dependencies]
 # TUI framework
@@ -111,6 +123,10 @@ async-trait = { version = "0.1", optional = true }
 # Smart Log Explorer (optional)
 chrono = { version = "0.4", features = ["serde"], optional = true }
 notify = { version = "6", optional = true }
+openssh = { version = "0.10", optional = true }
+openssh-sftp-client = { version = "0.14", optional = true }
+tempfile = { version = "3.10", optional = true }
+bytes = "1.11.1"
 
 [profile.release]
 # Size vs speed: "z" minimizes binary size; 3 favors editor redraw throughput. LTO + strip keep releases lean.

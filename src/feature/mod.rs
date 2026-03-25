@@ -12,3 +12,9 @@ pub mod outline;
 pub mod search;
 pub mod session;
 pub mod syntax;
+
+#[cfg(feature = "timeline")]
+pub mod timeline;
+
+#[cfg(feature = "ssh")]
+pub mod ssh;

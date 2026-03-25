@@ -10,6 +10,10 @@ use crate::core::cursor::Cursor;
 use crate::core::history::{EditCommand, History};
 use crate::error::Result;
 use crate::feature::search::SearchMatch;
+#[cfg(feature = "timeline")]
+use crate::feature::timeline::TimelineSender;
+#[cfg(feature = "timeline")]
+use crate::feature::timeline::models::{TimelineOp, TimelineEvent};
 
 /// Represents a single open file/buffer with all editing state.
 pub struct Document {
@@ -25,6 +29,8 @@ pub struct Document {
     pub scroll_y: usize,
     /// Horizontal scroll offset.
     pub scroll_x: usize,
+    #[cfg(feature = "timeline")]
+    pub timeline_sender: Option<TimelineSender>,
 }
 
 impl Document {
@@ -37,6 +43,8 @@ impl Document {
             language: "text".to_string(),
             scroll_y: 0,
             scroll_x: 0,
+            #[cfg(feature = "timeline")]
+            timeline_sender: None,
         }
     }
 
@@ -46,6 +54,14 @@ impl Document {
     pub fn open(path: &Path) -> Result<Self> {
         let buffer = Buffer::from_file_or_new(path)?;
         let language = crate::feature::language::detect_language(path, &buffer);
+        #[cfg(feature = "timeline")]
+        let timeline_sender = if path.starts_with(dirs::data_local_dir().unwrap_or_default()) {
+            None
+        } else {
+            let sender = crate::feature::timeline::start_worker(path.to_path_buf());
+            sender.send_init(buffer.to_string());
+            Some(sender)
+        };
 
         Ok(Self {
             buffer,
@@ -54,10 +70,24 @@ impl Document {
             language,
             scroll_y: 0,
             scroll_x: 0,
+            #[cfg(feature = "timeline")]
+            timeline_sender,
         })
     }
 
     /// Recompute `language` from the buffer path and contents (e.g. after Save As).
+
+    #[cfg(feature = "timeline")]
+    pub fn notify_timeline(&self, op: TimelineOp) {
+        if let Some(sender) = &self.timeline_sender {
+            sender.send_raw_event(TimelineEvent::Edit {
+                op,
+                cursor_line: self.cursor.line,
+                cursor_col: self.cursor.col,
+            });
+        }
+    }
+
     pub fn refresh_language(&mut self) {
         let path = self
             .buffer
@@ -72,11 +102,21 @@ impl Document {
         let pos = self.cursor.char_index(&self.buffer);
         let text = ch.to_string();
 
-        self.history.record(
-            EditCommand::Insert {
+        let __cmd = EditCommand::Insert {
                 pos,
                 text: text.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -100,11 +140,21 @@ impl Document {
         }
         let pos = self.cursor.char_index(&self.buffer);
 
-        self.history.record(
-            EditCommand::Insert {
+        let __cmd = EditCommand::Insert {
                 pos,
                 text: text.to_string(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -136,11 +186,21 @@ impl Document {
         let deleted_char = self.buffer.rope.char(pos - 1);
         let deleted = deleted_char.to_string();
 
-        self.history.record(
-            EditCommand::Delete {
+        let __cmd = EditCommand::Delete {
                 pos: pos - 1,
                 text: deleted,
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -167,11 +227,21 @@ impl Document {
         let deleted_char = self.buffer.rope.char(pos);
         let deleted = deleted_char.to_string();
 
-        self.history.record(
-            EditCommand::Delete {
+        let __cmd = EditCommand::Delete {
                 pos,
                 text: deleted,
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -189,12 +259,22 @@ impl Document {
         }
         let start = pos - prefix_len;
         let deleted = self.buffer.rope.slice(start..pos).to_string();
-        self.history.record(
-            EditCommand::Replace {
+        let __cmd = EditCommand::Replace {
                 pos: start,
                 old_text: deleted,
                 new_text: new_text.to_string(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -215,11 +295,21 @@ impl Document {
 
         let deleted = self.buffer.rope.slice(start..end).to_string();
 
-        self.history.record(
-            EditCommand::Delete {
+        let __cmd = EditCommand::Delete {
                 pos: start,
                 text: deleted.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -252,11 +342,21 @@ impl Document {
 
         let text = self.buffer.rope.slice(line_start..line_end).to_string();
 
-        self.history.record(
-            EditCommand::Delete {
+        let __cmd = EditCommand::Delete {
                 pos: line_start,
                 text,
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -289,12 +389,22 @@ impl Document {
         let combined_old = format!("{}{}", prev_text, current_text);
         let combined_new = format!("{}{}", current_text, prev_text);
 
-        self.history.record(
-            EditCommand::Replace {
+        let __cmd = EditCommand::Replace {
                 pos: prev_start,
                 old_text: combined_old.clone(),
                 new_text: combined_new.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -327,12 +437,22 @@ impl Document {
         let combined_old = format!("{}{}", current_text, next_text);
         let combined_new = format!("{}{}", next_text, current_text);
 
-        self.history.record(
-            EditCommand::Replace {
+        let __cmd = EditCommand::Replace {
                 pos: curr_start,
                 old_text: combined_old,
                 new_text: combined_new.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -367,14 +487,24 @@ impl Document {
                 .slice(pos..pos + remove_len)
                 .to_string();
 
-            self.history.record(
-                EditCommand::Delete {
+            let __cmd = EditCommand::Delete {
                     pos,
                     text: deleted_text,
-                },
-                self.cursor.line,
-                self.cursor.col,
-            );
+                };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
+            self.cursor.line,
+            self.cursor.col,
+        );
             self.buffer.delete(pos, pos + remove_len);
         } else {
             // Add comment at the start of non-whitespace
@@ -382,14 +512,24 @@ impl Document {
             let pos = line_start + indent_len;
             let insert_text = format!("{} ", comment_prefix);
 
-            self.history.record(
-                EditCommand::Insert {
+            let __cmd = EditCommand::Insert {
                     pos,
                     text: insert_text.clone(),
-                },
-                self.cursor.line,
-                self.cursor.col,
-            );
+                };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
+            self.cursor.line,
+            self.cursor.col,
+        );
             self.buffer.insert(pos, &insert_text);
         }
     }
@@ -400,11 +540,21 @@ impl Document {
         let line = self.cursor.line;
         let pos = self.buffer.line_to_char(line);
 
-        self.history.record(
-            EditCommand::Insert {
+        let __cmd = EditCommand::Insert {
                 pos,
                 text: indent.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -427,11 +577,21 @@ impl Document {
         }
 
         let deleted = " ".repeat(leading_spaces);
-        self.history.record(
-            EditCommand::Delete {
+        let __cmd = EditCommand::Delete {
                 pos,
                 text: deleted,
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -445,12 +605,17 @@ impl Document {
     pub fn undo(&mut self) {
         if let Some((cmd, line, col)) = self.history.undo() {
             match cmd {
+                
                 EditCommand::Insert { pos, text } => {
                     self.buffer
                         .delete(pos, pos + text.chars().count());
+                    #[cfg(feature = "timeline")]
+                    self.notify_timeline(TimelineOp::Delete { pos, text });
                 }
                 EditCommand::Delete { pos, text } => {
                     self.buffer.insert(pos, &text);
+                    #[cfg(feature = "timeline")]
+                    self.notify_timeline(TimelineOp::Insert { pos, text });
                 }
                 EditCommand::Replace {
                     pos,
@@ -460,7 +625,10 @@ impl Document {
                     self.buffer
                         .delete(pos, pos + new_text.chars().count());
                     self.buffer.insert(pos, &old_text);
+                    #[cfg(feature = "timeline")]
+                    self.notify_timeline(TimelineOp::Replace { pos, old_text: new_text, new_text: old_text });
                 }
+
             }
             self.cursor.line = line;
             self.cursor.col = col;
@@ -474,8 +642,11 @@ impl Document {
     pub fn redo(&mut self) {
         if let Some(cmd) = self.history.redo() {
             match cmd {
+
                 EditCommand::Insert { pos, ref text } => {
                     self.buffer.insert(pos, text);
+                    #[cfg(feature = "timeline")]
+                    self.notify_timeline(TimelineOp::Insert { pos: pos, text: text.clone() });
                     let end = pos + text.chars().count();
                     self.cursor.line = self.buffer.char_to_line(end);
                     let line_start = self.buffer.line_to_char(self.cursor.line);
@@ -484,6 +655,8 @@ impl Document {
                 EditCommand::Delete { pos, ref text } => {
                     self.buffer
                         .delete(pos, pos + text.chars().count());
+                    #[cfg(feature = "timeline")]
+                    self.notify_timeline(TimelineOp::Delete { pos: pos, text: text.clone() });
                     self.cursor.line = self.buffer.char_to_line(pos);
                     let line_start = self.buffer.line_to_char(self.cursor.line);
                     self.cursor.col = pos - line_start;
@@ -496,6 +669,8 @@ impl Document {
                     self.buffer
                         .delete(pos, pos + old_text.chars().count());
                     self.buffer.insert(pos, new_text);
+                    #[cfg(feature = "timeline")]
+                    self.notify_timeline(TimelineOp::Replace { pos: pos, old_text: old_text.clone(), new_text: new_text.clone() });
                     let end = pos + new_text.chars().count();
                     self.cursor.line = self.buffer.char_to_line(end);
                     let line_start = self.buffer.line_to_char(self.cursor.line);
@@ -513,12 +688,22 @@ impl Document {
             return false;
         }
         let old_text = self.buffer.rope.slice(start..end).to_string();
-        self.history.record(
-            EditCommand::Replace {
+        let __cmd = EditCommand::Replace {
                 pos: start,
                 old_text,
                 new_text: new_text.to_string(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -544,11 +729,21 @@ impl Document {
             self.buffer.len_chars()
         };
         let text = self.buffer.rope.slice(line_start..line_end).to_string();
-        self.history.record(
-            EditCommand::Insert {
+        let __cmd = EditCommand::Insert {
                 pos: line_end,
                 text: text.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );
@@ -575,12 +770,22 @@ impl Document {
             return 0;
         }
         let n = matches.len();
-        self.history.record(
-            EditCommand::Replace {
+        let __cmd = EditCommand::Replace {
                 pos: 0,
                 old_text,
                 new_text: new_text.clone(),
-            },
+            };
+        #[cfg(feature = "timeline")]
+        {
+            let op = match &__cmd {
+                EditCommand::Insert { pos, text } => TimelineOp::Insert { pos: *pos, text: text.clone() },
+                EditCommand::Delete { pos, text } => TimelineOp::Delete { pos: *pos, text: text.clone() },
+                EditCommand::Replace { pos, old_text, new_text } => TimelineOp::Replace { pos: *pos, old_text: old_text.clone(), new_text: new_text.clone() },
+            };
+            self.notify_timeline(op);
+        }
+        self.history.record(
+            __cmd,
             self.cursor.line,
             self.cursor.col,
         );

@@ -97,7 +97,7 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Resolve API key from env, then explicit string.
+/// Resolve API key from env, CLI, config, then optional embed (see `config::embed`).
 pub fn resolve_api_key(from_cli: Option<&str>, from_config: Option<&str>) -> Option<String> {
     std::env::var("GEMINI_API_KEY")
         .ok()
@@ -113,6 +113,9 @@ pub fn resolve_api_key(from_cli: Option<&str>, from_config: Option<&str>) -> Opt
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            crate::config::embed::embedded_gemini_api_key().map(|s| s.to_string())
         })
 }
 

@@ -90,6 +90,7 @@ pub enum Action {
     // === App ===
     Quit,
     ForceQuit,
+    Deploy,
 
     // === Mouse ===
     MouseClick(u16, u16),

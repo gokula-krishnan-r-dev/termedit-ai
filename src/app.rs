@@ -23,6 +23,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Terminal;
 
+#[cfg(feature = "ai")]
+use crate::config::embed;
 use crate::config::keymap::{self, Action};
 use crate::config::settings::Settings;
 use crate::config::theme::Theme;
@@ -153,9 +155,19 @@ pub struct App {
     #[cfg(feature = "ai")]
     gemini_rx: mpsc::Receiver<(u64, Result<String, gemini_chat::GeminiError>)>,
     #[cfg(feature = "ai")]
-    gemini_request_tx: mpsc::Sender<(u64, GeminiChatRequest)>,
-    #[cfg(feature = "ai")]
     gemini_generation: u64,
+    #[cfg(feature = "ssh")]
+    pub ssh_context: Option<crate::feature::ssh::SshContext>,
+    #[cfg(feature = "ssh")]
+    pub ssh_diff_state: Option<SshDiffState>,
+}
+
+#[cfg(feature = "ssh")]
+pub struct SshDiffState {
+    pub filename: String,
+    pub diff: String,
+    pub remote_path: std::path::PathBuf,
+    pub scroll: u16,
 }
 
 /// State for the completion dropdown (keyword/buffer suggestions).
@@ -242,6 +254,10 @@ impl App {
             gemini_request_tx,
             #[cfg(feature = "ai")]
             gemini_generation: 0,
+            #[cfg(feature = "ssh")]
+            ssh_context: None,
+            #[cfg(feature = "ssh")]
+            ssh_diff_state: None,
         }
     }
 
@@ -298,6 +314,7 @@ impl App {
                     .filter(|s| !s.is_empty())
                     .cloned()
             })
+            .or_else(|| embed::embedded_gemini_api_key().map(|s| s.to_string()))
     }
 
     #[cfg(feature = "ai")]
@@ -319,7 +336,7 @@ impl App {
 
         let Some(api_key) = self.resolve_gemini_api_key() else {
             self.ai_panel.error = Some(
-                "Set GEMINI_API_KEY (env) or gemini_api_key in config.toml.".to_string(),
+                "Set GEMINI_API_KEY (env), gemini_api_key in config.toml, LOCAL_GEMINI_API_KEY in source, or build with TERMINEDIT_EMBEDDED_GEMINI_KEY.".to_string(),
             );
             self.dirty = true;
             return;
@@ -695,7 +712,24 @@ impl App {
             self.status_message = Some("Path is empty".into());
             return;
         }
-        let path = Self::expand_user_path(trimmed);
+        let mut path = Self::expand_user_path(trimmed);
+
+        #[cfg(feature = "ssh")]
+        if self.ssh_context.is_some() && mode == PathPromptMode::Open {
+            let ctx = self.ssh_context.as_mut().unwrap();
+            let remote_path = path.clone();
+            match ctx.rt.block_on(ctx.sync.download_file(&remote_path)) {
+                Ok(local_path) => {
+                    ctx.local_to_remote.insert(local_path.clone(), remote_path.clone());
+                    path = local_path;
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Failed to download {}: {}", remote_path.display(), e));
+                    return;
+                }
+            }
+        }
+
         let tab = self.active_tab;
         match mode {
             PathPromptMode::SaveAs => match self.documents[tab].save_as(&path) {
@@ -1113,6 +1147,14 @@ impl App {
                 } else if self.ai_panel_is_visible() {
                     #[cfg(feature = "ai")]
                     self.handle_ai_panel_key(key_event);
+                } else if {
+                    #[cfg(feature = "ssh")]
+                    { self.ssh_diff_state.is_some() }
+                    #[cfg(not(feature = "ssh"))]
+                    { false }
+                } {
+                    #[cfg(feature = "ssh")]
+                    self.handle_ssh_diff_key(key_event);
                 } else if self.modal.is_some() {
                     self.handle_modal_key(key_event);
                 } else if let Some(ref mut comp) = self.completion_list {
@@ -1158,6 +1200,49 @@ impl App {
                 self.viewport_width = w as usize;
                 self.viewport_height = h.saturating_sub(2) as usize;
                 self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    fn handle_ssh_diff_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.ssh_diff_state = None;
+                self.status_message = Some("Sync cancelled.".to_string());
+                self.dirty = true;
+            }
+            KeyCode::Char('y') => {
+                if let Some(state) = self.ssh_diff_state.take() {
+                    if let Some(ctx) = &mut self.ssh_context {
+                        let tab = self.active_tab;
+                        let local_path = self.documents[tab].buffer.file_path.as_ref().unwrap().clone();
+                        match self.documents[tab].save() {
+                            Ok(()) => {
+                                match ctx.rt.block_on(ctx.sync.upload_file(&local_path, &state.remote_path)) {
+                                    Ok(()) => self.status_message = Some("Sync successful.".to_string()),
+                                    Err(e) => self.status_message = Some(format!("Sync failed: {}", e)),
+                                }
+                            }
+                            Err(e) => self.status_message = Some(format!("Local save failed: {}", e)),
+                        }
+                    }
+                }
+                self.dirty = true;
+            }
+            KeyCode::Up => {
+                if let Some(state) = &mut self.ssh_diff_state {
+                    state.scroll = state.scroll.saturating_sub(1);
+                    self.dirty = true;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(state) = &mut self.ssh_diff_state {
+                    state.scroll = state.scroll.saturating_add(1);
+                    self.dirty = true;
+                }
             }
             _ => {}
         }
@@ -1453,9 +1538,28 @@ impl App {
                     self.path_prompt_after_save = None;
                     self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
                 } else {
-                    match self.documents[tab].save() {
-                        Ok(()) => self.status_message = Some("Saved".to_string()),
-                        Err(e) => self.status_message = Some(format!("Save failed: {}", e)),
+                    let mut is_remote = false;
+                    #[cfg(feature = "ssh")]
+                    if let Some(ctx) = &self.ssh_context {
+                        let local_path = self.documents[tab].buffer.file_path.as_ref().unwrap();
+                        if let Some(remote_path) = ctx.local_to_remote.get(local_path) {
+                            is_remote = true;
+                            let modified = self.documents[tab].buffer.to_string();
+                            let original = ctx.rt.block_on(ctx.sync.get_remote_content(remote_path)).unwrap_or_default();
+                            let diff = crate::feature::ssh::sync::SshSyncManager::compute_diff(&original, &modified);
+                            self.ssh_diff_state = Some(SshDiffState {
+                                filename: remote_path.to_string_lossy().into_owned(),
+                                diff,
+                                remote_path: remote_path.to_path_buf(),
+                                scroll: 0,
+                            });
+                        }
+                    }
+                    if !is_remote {
+                        match self.documents[tab].save() {
+                            Ok(()) => self.status_message = Some("Saved".to_string()),
+                            Err(e) => self.status_message = Some(format!("Save failed: {}", e)),
+                        }
                     }
                 }
             }
@@ -1716,6 +1820,25 @@ impl App {
             }
             Action::ForceQuit => {
                 self.should_quit = true;
+            }
+            Action::Deploy => {
+                #[cfg(feature = "ssh")]
+                if let Some(ctx) = &self.ssh_context {
+                    match ctx.rt.block_on(ctx.deployer.execute_deploy()) {
+                        Ok(msg) => {
+                            self.status_message = Some(msg);
+                        }
+                        Err(e) => {
+                            self.status_message = Some(e.to_string());
+                        }
+                    }
+                } else {
+                    self.status_message = Some("Deploy is only available in SSH mode.".to_string());
+                }
+                #[cfg(not(feature = "ssh"))]
+                {
+                    self.status_message = Some("Deploy requires the `ssh` feature.".to_string());
+                }
             }
 
             _ => {}
@@ -2338,6 +2461,32 @@ impl App {
         );
 
         // Modal overlay
+        #[cfg(feature = "ssh")]
+        if let Some(diff_state) = &self.ssh_diff_state {
+            frame.render_widget(
+                crate::feature::ssh::ui::SshDiffModalWidget {
+                    diff: &diff_state.diff,
+                    filename: &diff_state.filename,
+                    scroll: diff_state.scroll,
+                    theme: &self.theme,
+                },
+                editor_area,
+            );
+        } else if let Some(ref modal) = self.modal {
+            let search_status =
+                if modal.kind == ModalKind::Find || modal.kind == ModalKind::FindReplace {
+                    Some(self.search.find_bar_status())
+                } else {
+                    None
+                };
+            frame.render_widget(
+                ModalWidget::new(modal, &self.theme)
+                    .search_status(search_status)
+                    .find_bar_anim(self.find_bar_anim_frames),
+                editor_area,
+            );
+        }
+        #[cfg(not(feature = "ssh"))]
         if let Some(ref modal) = self.modal {
             let search_status =
                 if modal.kind == ModalKind::Find || modal.kind == ModalKind::FindReplace {

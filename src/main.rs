@@ -140,6 +140,10 @@ struct Cli {
     /// Usage: termedit logs <FILE>
     #[command(subcommand)]
     command: Option<SubCommand>,
+
+    /// Open Time Travel Debugging timeline for the given file.
+    #[arg(long, value_name = "FILE")]
+    timeline: Option<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -167,6 +171,15 @@ enum SubCommand {
         #[arg(long = "ai-model", value_name = "MODEL")]
         ai_model: Option<String>,
     },
+    /// Remote Server Editing mode.
+    ///
+    /// Example:
+    ///   termedit ssh user@server
+    Ssh {
+        /// User and server address (e.g., user@server)
+        #[arg(value_name = "TARGET")]
+        target: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -180,9 +193,12 @@ fn main() -> anyhow::Result<()> {
     if let Some(SubCommand::Logs { file, from_start, gemini_api_key, ai_model }) = cli.command {
         #[cfg(feature = "logs")]
         {
-            // Resolve API key: CLI flag → env var → None (AI features disabled).
+            // Resolve API key: CLI flag → env var → optional embed → None (AI disabled).
             let api_key = gemini_api_key
-                .or_else(|| std::env::var("GEMINI_API_KEY").ok());
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+                .or_else(|| {
+                    config::embed::embedded_gemini_api_key().map(|s| s.to_string())
+                });
 
             let model_id = ai_model.unwrap_or_else(|| {
                 feature::gemini_chat::default_chat_model_id().to_string()
@@ -200,6 +216,24 @@ fn main() -> anyhow::Result<()> {
             eprintln!(
                 "termedit: `termedit logs` requires building with the `logs` feature.\n\
                  Try: cargo install termedit --features logs"
+            );
+            return Ok(());
+        }
+    }
+
+    let mut is_ssh = false;
+    let mut ssh_target = None;
+    if let Some(SubCommand::Ssh { target }) = &cli.command {
+        #[cfg(feature = "ssh")]
+        {
+            is_ssh = true;
+            ssh_target = Some(target.clone());
+        }
+        #[cfg(not(feature = "ssh"))]
+        {
+            eprintln!(
+                "termedit: `termedit ssh` requires building with the `ssh` feature.\n\
+                 Try: cargo install termedit --features ssh"
             );
             return Ok(());
         }
@@ -334,6 +368,22 @@ fn main() -> anyhow::Result<()> {
 
     // Create app
     let mut app = app::App::new(settings, theme);
+
+    if is_ssh {
+        #[cfg(feature = "ssh")]
+        if let Some(target) = ssh_target {
+            println!("Connecting to SSH target: {}...", target);
+            match feature::ssh::SshContext::init(&target) {
+                Ok(ctx) => {
+                    app.ssh_context = Some(ctx);
+                }
+                Err(e) => {
+                    eprintln!("termedit: failed to initialize SSH: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     if do_restore {
         if let Some(session_path) = session::default_session_path() {

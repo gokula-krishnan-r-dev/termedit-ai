@@ -31,6 +31,7 @@ pub enum PaletteCmd {
     ToggleFileTree,
     NextTab,
     PrevTab,
+    Deploy,
 }
 
 impl PaletteCmd {
@@ -54,6 +55,7 @@ impl PaletteCmd {
             PaletteCmd::ToggleFileTree => "Toggle File Tree",
             PaletteCmd::NextTab => "Next Tab",
             PaletteCmd::PrevTab => "Previous Tab",
+            PaletteCmd::Deploy => "Deploy (SSH Mode)",
         }
     }
 
@@ -76,6 +78,7 @@ impl PaletteCmd {
             PaletteCmd::ToggleFileTree,
             PaletteCmd::NextTab,
             PaletteCmd::PrevTab,
+            PaletteCmd::Deploy,
             PaletteCmd::Quit,
         ]
     }
@@ -100,6 +103,7 @@ impl PaletteCmd {
             PaletteCmd::ToggleFileTree => Some(Action::ToggleFileTree),
             PaletteCmd::NextTab => Some(Action::NextTab),
             PaletteCmd::PrevTab => Some(Action::PrevTab),
+            PaletteCmd::Deploy => Some(Action::Deploy),
         }
     }
 }
