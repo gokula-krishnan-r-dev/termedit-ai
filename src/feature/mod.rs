@@ -1,4 +1,6 @@
 pub mod ai_completion;
+#[cfg(feature = "ai-server")]
+pub mod ai_server;
 pub mod brackets;
 pub mod gemini_chat;
 pub mod git_worktree;

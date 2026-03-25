@@ -48,6 +48,9 @@ Examples:
   termedit --open-git-changed
       Open git dirty/untracked files from the current repo as tabs.
 
+  termedit --ai-server
+      (Feature `ai-server`) Interactive DevOps assistant: server context + Gemini REPL.
+
   termedit -- --weird-name.txt
       Open a file whose name starts with '-' (paths after -- are files).
 ";
@@ -104,6 +107,26 @@ struct Cli {
     /// Open files reported by `git status --porcelain` in the current directory as tabs (skips session restore if any paths listed; skips deletions).
     #[arg(long)]
     open_git_changed: bool,
+
+    /// AI DevOps assistant: collect logs, configs, metrics; Gemini REPL (requires `ai-server` feature).
+    #[arg(long = "ai-server")]
+    ai_server: bool,
+
+    /// Gemini model id for `--ai-server` (overrides `--ai-chat-model` / config when set).
+    #[arg(long = "ai-server-model", value_name = "MODEL")]
+    ai_server_model: Option<String>,
+
+    /// Override cache directory for `--ai-server` context snapshots.
+    #[arg(long = "ai-server-cache-dir", value_name = "DIR")]
+    ai_server_cache_dir: Option<std::path::PathBuf>,
+
+    /// Show diffs and prompts but do not write files in `--ai-server` mode.
+    #[arg(long = "ai-server-dry-run")]
+    ai_server_dry_run: bool,
+
+    /// Send literal `.env` values to the model (unsafe; default is REDACTED).
+    #[arg(long = "ai-server-include-secrets")]
+    ai_server_include_secrets: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,6 +135,42 @@ fn main() -> anyhow::Result<()> {
 
     // Parse CLI arguments
     let cli = Cli::parse();
+
+    if cli.ai_server {
+        #[cfg(feature = "ai-server")]
+        {
+            let settings = config::settings::Settings::load();
+            let api_some = feature::ai_server::resolve_api_key(
+                cli.gemini_api_key.as_deref(),
+                settings.gemini_api_key.as_deref(),
+            );
+            let Some(api_key) = api_some else {
+                anyhow::bail!(
+                    "termedit --ai-server requires GEMINI_API_KEY, or --gemini-api-key, or gemini_api_key in config."
+                );
+            };
+            let model = feature::ai_server::resolve_model(
+                cli.ai_server_model
+                    .as_deref()
+                    .or(cli.ai_chat_model.as_deref()),
+                settings.ai_chat_model.as_deref(),
+            );
+            return feature::ai_server::run(feature::ai_server::AiServerOptions {
+                api_key,
+                model_id: model,
+                cache_dir: cli.ai_server_cache_dir.clone(),
+                dry_run: cli.ai_server_dry_run,
+                include_secrets: cli.ai_server_include_secrets,
+            });
+        }
+        #[cfg(not(feature = "ai-server"))]
+        {
+            eprintln!(
+                "termedit: --ai-server requires building with feature `ai-server` (e.g. cargo install termedit --features ai-server)."
+            );
+            return Ok(());
+        }
+    }
 
     if cli.list_gemini_models {
         #[cfg(feature = "ai")]
