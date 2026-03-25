@@ -5,7 +5,7 @@
 
 use ropey::Rope;
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, TermEditError};
@@ -104,6 +104,25 @@ impl Buffer {
             encoding,
             line_ending,
         })
+    }
+
+    /// Load from disk or create an in-memory buffer for a path that does not exist yet.
+    pub fn from_file_or_new(path: &Path) -> Result<Self> {
+        match Self::from_file(path) {
+            Ok(b) => Ok(b),
+            Err(TermEditError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(Self {
+                rope: Rope::new(),
+                file_path: Some(path.to_path_buf()),
+                modified: false,
+                encoding: Encoding::Utf8,
+                line_ending: if cfg!(windows) {
+                    LineEnding::Crlf
+                } else {
+                    LineEnding::Lf
+                },
+            }),
+            Err(e) => Err(e),
+        }
     }
 
     /// Decode raw bytes into a String, detecting encoding.
@@ -251,6 +270,12 @@ impl Buffer {
             Encoding::Latin1 => text.bytes().collect(),
         };
 
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(TermEditError::Io)?;
+            }
+        }
+
         let file = fs::File::create(path).map_err(TermEditError::Io)?;
         let mut writer = BufWriter::new(file);
         writer.write_all(&bytes).map_err(TermEditError::Io)?;
@@ -281,8 +306,6 @@ impl Default for Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     #[test]
     fn test_new_empty_buffer() {
@@ -355,5 +378,27 @@ mod tests {
     fn test_display_name_untitled() {
         let buf = Buffer::new();
         assert_eq!(buf.display_name(), "Untitled");
+    }
+
+    #[test]
+    fn test_from_file_or_new_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new_file.txt");
+        assert!(!path.exists());
+        let buf = Buffer::from_file_or_new(&path).unwrap();
+        assert!(buf.file_path.as_ref().unwrap() == &path);
+        assert!(!buf.modified);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_save_to_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("dir").join("out.txt");
+        let mut buf = Buffer::new();
+        buf.insert(0, "hello");
+        buf.save_to(&path).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
     }
 }

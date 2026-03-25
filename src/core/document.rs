@@ -9,6 +9,7 @@ use crate::core::buffer::Buffer;
 use crate::core::cursor::Cursor;
 use crate::core::history::{EditCommand, History};
 use crate::error::Result;
+use crate::feature::search::SearchMatch;
 
 /// Represents a single open file/buffer with all editing state.
 pub struct Document {
@@ -40,8 +41,10 @@ impl Document {
     }
 
     /// Open a file and create a document from it.
+    ///
+    /// If the path does not exist yet, opens an empty buffer with that path set (save will create the file).
     pub fn open(path: &Path) -> Result<Self> {
-        let buffer = Buffer::from_file(path)?;
+        let buffer = Buffer::from_file_or_new(path)?;
         let language = crate::feature::language::detect_language(path, &buffer);
 
         Ok(Self {
@@ -52,6 +55,16 @@ impl Document {
             scroll_y: 0,
             scroll_x: 0,
         })
+    }
+
+    /// Recompute `language` from the buffer path and contents (e.g. after Save As).
+    pub fn refresh_language(&mut self) {
+        let path = self
+            .buffer
+            .file_path
+            .as_deref()
+            .unwrap_or(Path::new(""));
+        self.language = crate::feature::language::detect_language(path, &self.buffer);
     }
 
     /// Insert a character at the cursor position.
@@ -494,6 +507,89 @@ impl Document {
         }
     }
 
+    /// Replace the half-open character range `[start, end)` with `new_text` (one undo step).
+    pub fn replace_char_range(&mut self, start: usize, end: usize, new_text: &str) -> bool {
+        if start >= end || end > self.buffer.len_chars() {
+            return false;
+        }
+        let old_text = self.buffer.rope.slice(start..end).to_string();
+        self.history.record(
+            EditCommand::Replace {
+                pos: start,
+                old_text,
+                new_text: new_text.to_string(),
+            },
+            self.cursor.line,
+            self.cursor.col,
+        );
+        self.buffer.delete(start, end);
+        self.buffer.insert(start, new_text);
+        let new_len = new_text.chars().count();
+        self.cursor.line = self.buffer.char_to_line(start);
+        let line_start = self.buffer.line_to_char(self.cursor.line);
+        self.cursor.col = start - line_start + new_len;
+        self.cursor.col_target = self.cursor.col;
+        self.cursor.clear_selection();
+        self.buffer.modified = true;
+        true
+    }
+
+    /// Duplicate the current line after itself (Ctrl+Shift+D).
+    pub fn duplicate_line(&mut self) {
+        let line = self.cursor.line;
+        let line_start = self.buffer.line_to_char(line);
+        let line_end = if line + 1 < self.buffer.line_count() {
+            self.buffer.line_to_char(line + 1)
+        } else {
+            self.buffer.len_chars()
+        };
+        let text = self.buffer.rope.slice(line_start..line_end).to_string();
+        self.history.record(
+            EditCommand::Insert {
+                pos: line_end,
+                text: text.clone(),
+            },
+            self.cursor.line,
+            self.cursor.col,
+        );
+        self.buffer.insert(line_end, &text);
+        self.cursor.line += 1;
+        self.cursor.col = 0;
+        self.cursor.col_target = 0;
+    }
+
+    /// Replace all search matches in one undo step (`SearchMatch` uses char indices).
+    pub fn replace_all_matches(&mut self, matches: &[SearchMatch], replacement: &str) -> usize {
+        if matches.is_empty() {
+            return 0;
+        }
+        let old_text = self.buffer.to_string();
+        let mut chars: Vec<char> = old_text.chars().collect();
+        for m in matches.iter().rev() {
+            if m.start < m.end && m.end <= chars.len() {
+                chars.splice(m.start..m.end, replacement.chars());
+            }
+        }
+        let new_text: String = chars.into_iter().collect();
+        if new_text == old_text {
+            return 0;
+        }
+        let n = matches.len();
+        self.history.record(
+            EditCommand::Replace {
+                pos: 0,
+                old_text,
+                new_text: new_text.clone(),
+            },
+            self.cursor.line,
+            self.cursor.col,
+        );
+        self.buffer.rope = ropey::Rope::from_str(&new_text);
+        self.buffer.modified = true;
+        self.cursor.clamp(&self.buffer);
+        n
+    }
+
     /// Save the document to disk.
     pub fn save(&mut self) -> Result<()> {
         self.buffer.save()
@@ -634,5 +730,36 @@ mod tests {
         doc.ensure_cursor_visible(20, 80);
         assert!(doc.scroll_y <= 50);
         assert!(doc.scroll_y + 20 > 50);
+    }
+
+    #[test]
+    fn test_duplicate_line() {
+        let mut doc = Document::new();
+        doc.insert_text("foo\nbar\n");
+        doc.cursor.line = 0;
+        doc.duplicate_line();
+        assert_eq!(doc.buffer.to_string(), "foo\nfoo\nbar\n");
+        assert_eq!(doc.cursor.line, 1);
+    }
+
+    #[test]
+    fn test_replace_all_matches() {
+        let mut doc = Document::new();
+        doc.insert_text("a b a");
+        let matches = vec![
+            SearchMatch {
+                start: 0,
+                end: 1,
+                text: "a".into(),
+            },
+            SearchMatch {
+                start: 4,
+                end: 5,
+                text: "a".into(),
+            },
+        ];
+        let n = doc.replace_all_matches(&matches, "Z");
+        assert_eq!(n, 2);
+        assert_eq!(doc.buffer.to_string(), "Z b Z");
     }
 }

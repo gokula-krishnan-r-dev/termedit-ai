@@ -17,6 +17,8 @@ pub struct StatusBar<'a> {
     theme: &'a Theme,
     search_status: Option<String>,
     message: Option<String>,
+    /// When set, shows `Tab {current}/{total}` (1-based index) for multi-tab sessions.
+    tab_hint: Option<(usize, usize)>,
 }
 
 impl<'a> StatusBar<'a> {
@@ -27,7 +29,14 @@ impl<'a> StatusBar<'a> {
             theme,
             search_status: None,
             message: None,
+            tab_hint: None,
         }
+    }
+
+    /// Show active tab position when multiple buffers are open.
+    pub fn tab_hint(mut self, current: usize, total: usize) -> Self {
+        self.tab_hint = Some((current, total));
+        self
     }
 
     /// Set a search status string (e.g., "3 of 12").
@@ -81,7 +90,14 @@ impl<'a> Widget for StatusBar<'a> {
             self.doc.cursor.line + 1,
             self.doc.cursor.col + 1
         );
-        let right = format!("{}  {}  {}  {} ", lang, encoding, line_ending, position);
+        let tab_part = self
+            .tab_hint
+            .map(|(i, n)| format!("Tab {}/{}  ", i, n))
+            .unwrap_or_default();
+        let right = format!(
+            "{}{}  {}  {}  {} ",
+            tab_part, lang, encoding, line_ending, position
+        );
 
         // Render sections
         let width = area.width as usize;

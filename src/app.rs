@@ -5,13 +5,13 @@
 
 use std::io;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
     MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
@@ -32,9 +32,12 @@ use crate::feature::completion;
 use crate::feature::search::{Search, SearchConfig};
 use crate::feature::session::{self, SessionState};
 use crate::feature::syntax::SyntaxHighlighter;
+use crate::ui::command_palette::{CommandPaletteState, CommandPaletteWidget};
 use crate::ui::editor_pane::EditorPane;
 use crate::ui::file_tree::FileTree;
-use crate::ui::modal::{ModalKind, ModalState, ModalWidget};
+use crate::ui::modal::{
+    FindReplaceFocus, ModalKind, ModalState, ModalWidget, PathPromptMode,
+};
 use crate::ui::status_bar::StatusBar;
 use crate::ui::tab_bar::{TabBar, TabInfo};
 
@@ -43,6 +46,13 @@ use crate::ui::tab_bar::{TabBar, TabInfo};
 pub enum SaveConfirmPending {
     CloseTab(usize),
     Quit,
+}
+
+/// After Save As from a path prompt, optionally close a tab or finish quit-save-all.
+#[derive(Debug, Clone)]
+pub enum PathAfterSave {
+    CloseTab(usize),
+    QuitSaveAll,
 }
 
 /// Main application state.
@@ -59,6 +69,12 @@ pub struct App {
     modal: Option<ModalState>,
     /// When SaveConfirm is shown, what to do after y/n.
     save_confirm_pending: Option<SaveConfirmPending>,
+    /// After path prompt Save As succeeds, run this next.
+    path_prompt_after_save: Option<PathAfterSave>,
+    /// Ctrl+P command palette.
+    command_palette: CommandPaletteState,
+    /// Reused buffer when building AI context (reduces allocations).
+    ai_context_before: String,
     /// Editor settings.
     settings: Settings,
     /// Active theme.
@@ -121,6 +137,9 @@ impl App {
             search: Search::new(),
             modal: None,
             save_confirm_pending: None,
+            path_prompt_after_save: None,
+            command_palette: CommandPaletteState::new(),
+            ai_context_before: String::new(),
             settings,
             theme,
             show_file_tree: false,
@@ -209,6 +228,142 @@ impl App {
         Ok(())
     }
 
+    fn refresh_tab_language(&mut self, tab: usize) {
+        if tab >= self.documents.len() {
+            return;
+        }
+        self.documents[tab].refresh_language();
+        self.highlighters[tab] = SyntaxHighlighter::new(&self.documents[tab].language);
+    }
+
+    fn remove_tab_at(&mut self, t: usize) {
+        if t >= self.documents.len() {
+            return;
+        }
+        self.documents.remove(t);
+        self.highlighters.remove(t);
+        if self.active_tab > t {
+            self.active_tab -= 1;
+        } else if self.active_tab == t {
+            self.active_tab = t.min(self.documents.len().saturating_sub(1));
+        }
+        if self.documents.is_empty() {
+            self.should_quit = true;
+        }
+    }
+
+    fn save_modified_with_paths(&mut self) -> Result<(), String> {
+        for i in 0..self.documents.len() {
+            if self.documents[i].is_modified() && self.documents[i].buffer.file_path.is_some() {
+                self.documents[i].save().map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn after_path_prompt_success(&mut self) {
+        match self.path_prompt_after_save.take() {
+            Some(PathAfterSave::CloseTab(t)) => {
+                self.remove_tab_at(t);
+            }
+            Some(PathAfterSave::QuitSaveAll) => {
+                if let Err(e) = self.save_modified_with_paths() {
+                    self.status_message = Some(e);
+                    self.path_prompt_after_save = Some(PathAfterSave::QuitSaveAll);
+                    return;
+                }
+                if let Some(i) = self.documents.iter().position(|d| d.is_modified()) {
+                    self.active_tab = i;
+                    self.path_prompt_after_save = Some(PathAfterSave::QuitSaveAll);
+                    self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Expand leading `~` to the user home directory.
+    fn expand_user_path(path_str: &str) -> PathBuf {
+        let trimmed = path_str.trim();
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            if let Some(home) = dirs::home_dir() {
+                return home.join(rest);
+            }
+        } else if trimmed == "~" {
+            if let Some(home) = dirs::home_dir() {
+                return home;
+            }
+        }
+        PathBuf::from(trimmed)
+    }
+
+    fn submit_path_prompt(&mut self, mode: PathPromptMode, path_str: &str) {
+        let trimmed = path_str.trim();
+        if trimmed.is_empty() {
+            self.status_message = Some("Path is empty".into());
+            return;
+        }
+        let path = Self::expand_user_path(trimmed);
+        let tab = self.active_tab;
+        match mode {
+            PathPromptMode::SaveAs => match self.documents[tab].save_as(&path) {
+                Ok(()) => {
+                    self.refresh_tab_language(tab);
+                    self.status_message = Some("Saved".into());
+                    self.modal = None;
+                    self.after_path_prompt_success();
+                }
+                Err(e) => self.status_message = Some(format!("Save failed: {}", e)),
+            },
+            PathPromptMode::Open => {
+                self.modal = None;
+                match self.open_file(&path) {
+                    Ok(()) => self.status_message = Some("Opened".into()),
+                    Err(e) => self.status_message = Some(format!("Open failed: {}", e)),
+                }
+            }
+        }
+    }
+
+    fn run_palette_selection(&mut self) {
+        let Some(cmd) = self.command_palette.selected_cmd() else {
+            return;
+        };
+        self.command_palette.close();
+        if let Some(action) = cmd.to_action() {
+            self.handle_action(action);
+        }
+    }
+
+    fn handle_command_palette_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.command_palette.close(),
+            KeyCode::Enter => self.run_palette_selection(),
+            KeyCode::Up => {
+                self.command_palette.selected = self.command_palette.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = self
+                    .command_palette
+                    .filtered_indices
+                    .len()
+                    .saturating_sub(1);
+                self.command_palette.selected = (self.command_palette.selected + 1).min(max);
+            }
+            KeyCode::Backspace => {
+                self.command_palette.filter.pop();
+                self.command_palette.rebuild_filtered();
+            }
+            KeyCode::Char(c) => {
+                self.command_palette.filter.push(c);
+                self.command_palette.rebuild_filtered();
+            }
+            _ => {}
+        }
+    }
+
     /// Run the main application event loop.
     pub fn run(&mut self) -> Result<()> {
         enable_raw_mode()?;
@@ -266,18 +421,18 @@ impl App {
                         let doc = &self.documents[tab];
                         let line = doc.buffer.line_text(doc.cursor.line);
                         let line_prefix: String = line.chars().take(doc.cursor.col).collect();
-                        let context_before: String = (0..doc.cursor.line)
-                            .rev()
-                            .take(30)
-                            .map(|i| doc.buffer.line_text(i))
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        let start_line = doc.cursor.line.saturating_sub(30);
+                        self.ai_context_before.clear();
+                        for j in start_line..doc.cursor.line {
+                            if j > start_line {
+                                self.ai_context_before.push('\n');
+                            }
+                            self.ai_context_before
+                                .push_str(&doc.buffer.line_text(j));
+                        }
                         let context = AiContext {
                             line_prefix,
-                            context_before,
+                            context_before: self.ai_context_before.clone(),
                             language: doc.language.clone(),
                             path: doc.buffer.file_path.as_ref().and_then(|p| p.to_str()).map(String::from),
                             model: self.settings.ai_model.clone(),
@@ -307,7 +462,9 @@ impl App {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Key(key_event) => {
-                if self.modal.is_some() {
+                if self.command_palette.visible {
+                    self.handle_command_palette_key(key_event);
+                } else if self.modal.is_some() {
                     self.handle_modal_key(key_event);
                 } else if let Some(ref mut comp) = self.completion_list {
                     let action = keymap::map_key_event(key_event);
@@ -573,6 +730,9 @@ impl App {
             Action::Dedent => {
                 self.documents[tab].dedent(tab_size);
             }
+            Action::DuplicateLine => {
+                self.documents[tab].duplicate_line();
+            }
 
             // === Clipboard ===
             Action::Copy => {
@@ -608,14 +768,23 @@ impl App {
 
             // === File Operations ===
             Action::Save => {
-                match self.documents[tab].save() {
-                    Ok(()) => self.status_message = Some("Saved".to_string()),
-                    Err(e) => self.status_message = Some(format!("Save failed: {}", e)),
+                if self.documents[tab].buffer.file_path.is_none() {
+                    self.path_prompt_after_save = None;
+                    self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
+                } else {
+                    match self.documents[tab].save() {
+                        Ok(()) => self.status_message = Some("Saved".to_string()),
+                        Err(e) => self.status_message = Some(format!("Save failed: {}", e)),
+                    }
                 }
             }
             Action::SaveAs => {
-                // TODO: implement save-as dialog
-                self.status_message = Some("Save As: not yet implemented".to_string());
+                self.ghost_suggestion = None;
+                self.ghost_trigger_pos = None;
+                self.ai_pending = false;
+                self.completion_list = None;
+                self.path_prompt_after_save = None;
+                self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
             }
             Action::NewFile => {
                 let doc = Document::new();
@@ -655,8 +824,11 @@ impl App {
                 }
             }
             Action::OpenFile => {
-                // TODO: implement file open dialog
-                self.status_message = Some("Open: not yet implemented".to_string());
+                self.ghost_suggestion = None;
+                self.ghost_trigger_pos = None;
+                self.ai_pending = false;
+                self.completion_list = None;
+                self.modal = Some(ModalState::prompt_path(PathPromptMode::Open));
             }
 
             // === Search ===
@@ -711,8 +883,13 @@ impl App {
             Action::ToggleFileTree => {
                 self.show_file_tree = !self.show_file_tree;
             }
-            Action::ToggleAiPanel | Action::CommandPalette => {
-                // TODO: future features
+            Action::ToggleAiPanel => {}
+            Action::CommandPalette => {
+                if self.command_palette.visible {
+                    self.command_palette.close();
+                } else {
+                    self.command_palette.open();
+                }
             }
 
             // === Tabs ===
@@ -732,6 +909,16 @@ impl App {
                     } else {
                         self.active_tab - 1
                     };
+                    self.ghost_suggestion = None;
+                    self.ghost_trigger_pos = None;
+                    self.ai_pending = false;
+                    self.completion_list = None;
+                }
+            }
+            Action::GoToTab(idx) => {
+                if !self.documents.is_empty() {
+                    let idx = idx.min(self.documents.len().saturating_sub(1));
+                    self.active_tab = idx;
                     self.ghost_suggestion = None;
                     self.ghost_trigger_pos = None;
                     self.ai_pending = false;
@@ -775,13 +962,18 @@ impl App {
     }
 
     /// Handle keyboard input when a modal is active.
-    fn handle_modal_key(&mut self, key: crossterm::event::KeyEvent) {
+    fn handle_modal_key(&mut self, key: KeyEvent) {
         let tab = self.active_tab;
 
-        // Destructure modal to check its kind without holding a borrow
         let modal_kind = match &self.modal {
             Some(m) => m.kind.clone(),
             None => return,
+        };
+
+        let live_find = |search: &mut Search, modal: &ModalState, doc_tab: usize, docs: &[Document]| {
+            let pattern = modal.input.clone();
+            let rope = &docs[doc_tab].buffer.rope;
+            search.find(SearchConfig::case_insensitive(&pattern), rope);
         };
 
         match key.code {
@@ -789,21 +981,99 @@ impl App {
                 if modal_kind == ModalKind::SaveConfirm {
                     self.save_confirm_pending = None;
                 }
+                if matches!(modal_kind, ModalKind::PromptPath(_)) {
+                    self.path_prompt_after_save = None;
+                }
                 self.modal = None;
                 return;
             }
+            KeyCode::Tab if modal_kind == ModalKind::FindReplace => {
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.toggle_find_replace_focus();
+                }
+                return;
+            }
+            KeyCode::BackTab if modal_kind == ModalKind::FindReplace => {
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.toggle_find_replace_focus();
+                }
+                return;
+            }
             KeyCode::Enter => {
-                match modal_kind {
+                let ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL);
+                match &modal_kind {
                     ModalKind::Find => {
-                        let pattern = self.modal.as_ref().unwrap().input.clone();
+                        let pattern = self
+                            .modal
+                            .as_ref()
+                            .map(|m| m.input.clone())
+                            .unwrap_or_default();
                         self.modal = None;
                         self.execute_search(&pattern);
                     }
                     ModalKind::FindReplace => {
-                        self.modal = None;
+                        let (pat, repl, focus) = self
+                            .modal
+                            .as_ref()
+                            .map(|m| {
+                                (
+                                    m.input.clone(),
+                                    m.replace_input.clone(),
+                                    m.find_replace_focus,
+                                )
+                            })
+                            .unwrap_or_default();
+                        match focus {
+                            FindReplaceFocus::Find => {
+                                self.modal = None;
+                                self.execute_search(&pat);
+                            }
+                            FindReplaceFocus::Replace => {
+                                if ctrl_enter {
+                                    let rope = &self.documents[tab].buffer.rope;
+                                    self.search
+                                        .find(SearchConfig::case_insensitive(&pat), rope);
+                                    let matches_snapshot = self.search.matches.clone();
+                                    let n = self.documents[tab]
+                                        .replace_all_matches(&matches_snapshot, &repl);
+                                    self.modal = None;
+                                    self.status_message =
+                                        Some(format!("Replaced {} occurrence(s)", n));
+                                } else {
+                                    let rope = &self.documents[tab].buffer.rope;
+                                    self.search
+                                        .find(SearchConfig::case_insensitive(&pat), rope);
+                                    let Some(m) = self.search.current().cloned() else {
+                                        self.status_message = Some("No match".into());
+                                        return;
+                                    };
+                                    self.documents[tab].replace_char_range(m.start, m.end, &repl);
+                                    let rope = &self.documents[tab].buffer.rope;
+                                    self.search
+                                        .find(SearchConfig::case_insensitive(&pat), rope);
+                                    if let Some(nm) = self.search.current().cloned() {
+                                        let doc = &mut self.documents[tab];
+                                        let line = doc.buffer.char_to_line(nm.start);
+                                        let line_start = doc.buffer.line_to_char(line);
+                                        let col = nm.start - line_start;
+                                        doc.cursor.goto(line, col, &doc.buffer);
+                                        doc.ensure_cursor_visible(
+                                            self.viewport_height,
+                                            self.viewport_width,
+                                        );
+                                    } else {
+                                        self.status_message = Some("No more matches".into());
+                                    }
+                                }
+                            }
+                        }
                     }
                     ModalKind::GoToLine => {
-                        let input = self.modal.as_ref().unwrap().input.clone();
+                        let input = self
+                            .modal
+                            .as_ref()
+                            .map(|m| m.input.clone())
+                            .unwrap_or_default();
                         self.modal = None;
                         if let Ok(line) = input.parse::<usize>() {
                             let target = line.saturating_sub(1);
@@ -818,46 +1088,60 @@ impl App {
                         self.modal = None;
                         self.save_confirm_pending = None;
                     }
+                    ModalKind::PromptPath(mode) => {
+                        let mode = *mode;
+                        let path_str = self
+                            .modal
+                            .as_ref()
+                            .map(|m| m.input.clone())
+                            .unwrap_or_default();
+                        self.submit_path_prompt(mode, &path_str);
+                    }
                 }
                 return;
             }
             KeyCode::Char('y') if modal_kind == ModalKind::SaveConfirm => {
-                let _ = self.documents[tab].save();
-                if let Some(pending) = self.save_confirm_pending.take() {
-                    match pending {
-                        SaveConfirmPending::CloseTab(t) => {
-                            self.documents.remove(t);
-                            self.highlighters.remove(t);
-                            if self.active_tab > t {
-                                self.active_tab -= 1;
-                            } else if self.active_tab == t {
-                                self.active_tab = t.min(self.documents.len().saturating_sub(1));
-                            }
-                            if self.documents.is_empty() {
-                                self.should_quit = true;
-                            }
+                let pending = match self.save_confirm_pending.take() {
+                    Some(p) => p,
+                    None => return,
+                };
+                self.modal = None;
+                match pending {
+                    SaveConfirmPending::CloseTab(t) => {
+                        if self.documents.get(t).is_none() {
+                            return;
                         }
-                        SaveConfirmPending::Quit => self.should_quit = true,
+                        if self.documents[t].buffer.file_path.is_some() {
+                            match self.documents[t].save() {
+                                Ok(()) => self.remove_tab_at(t),
+                                Err(e) => self.status_message = Some(format!("Save failed: {}", e)),
+                            }
+                        } else {
+                            self.active_tab = t;
+                            self.path_prompt_after_save = Some(PathAfterSave::CloseTab(t));
+                            self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
+                        }
+                    }
+                    SaveConfirmPending::Quit => {
+                        if let Err(e) = self.save_modified_with_paths() {
+                            self.status_message = Some(e);
+                            return;
+                        }
+                        if let Some(i) = self.documents.iter().position(|d| d.is_modified()) {
+                            self.active_tab = i;
+                            self.path_prompt_after_save = Some(PathAfterSave::QuitSaveAll);
+                            self.modal = Some(ModalState::prompt_path(PathPromptMode::SaveAs));
+                        } else {
+                            self.should_quit = true;
+                        }
                     }
                 }
-                self.modal = None;
                 return;
             }
             KeyCode::Char('n') if modal_kind == ModalKind::SaveConfirm => {
                 if let Some(pending) = self.save_confirm_pending.take() {
                     match pending {
-                        SaveConfirmPending::CloseTab(t) => {
-                            self.documents.remove(t);
-                            self.highlighters.remove(t);
-                            if self.active_tab > t {
-                                self.active_tab -= 1;
-                            } else if self.active_tab == t {
-                                self.active_tab = t.min(self.documents.len().saturating_sub(1));
-                            }
-                            if self.documents.is_empty() {
-                                self.should_quit = true;
-                            }
-                        }
+                        SaveConfirmPending::CloseTab(t) => self.remove_tab_at(t),
                         SaveConfirmPending::Quit => self.should_quit = true,
                     }
                 }
@@ -865,24 +1149,37 @@ impl App {
                 return;
             }
             KeyCode::Char(c) => {
+                let fr_focus = self
+                    .modal
+                    .as_ref()
+                    .map(|m| m.find_replace_focus)
+                    .unwrap_or(FindReplaceFocus::Find);
                 if let Some(modal) = self.modal.as_mut() {
                     modal.insert_char(c);
                 }
-                // Live search
-                if modal_kind == ModalKind::Find {
-                    let pattern = self.modal.as_ref().unwrap().input.clone();
-                    let rope = &self.documents[tab].buffer.rope;
-                    self.search.find(SearchConfig::case_insensitive(&pattern), rope);
+                if modal_kind == ModalKind::Find
+                    || (modal_kind == ModalKind::FindReplace && fr_focus == FindReplaceFocus::Find)
+                {
+                    if let Some(modal) = self.modal.as_ref() {
+                        live_find(&mut self.search, modal, tab, &self.documents);
+                    }
                 }
             }
             KeyCode::Backspace => {
+                let fr_focus = self
+                    .modal
+                    .as_ref()
+                    .map(|m| m.find_replace_focus)
+                    .unwrap_or(FindReplaceFocus::Find);
                 if let Some(modal) = self.modal.as_mut() {
                     modal.backspace();
                 }
-                if modal_kind == ModalKind::Find {
-                    let pattern = self.modal.as_ref().unwrap().input.clone();
-                    let rope = &self.documents[tab].buffer.rope;
-                    self.search.find(SearchConfig::case_insensitive(&pattern), rope);
+                if modal_kind == ModalKind::Find
+                    || (modal_kind == ModalKind::FindReplace && fr_focus == FindReplaceFocus::Find)
+                {
+                    if let Some(modal) = self.modal.as_ref() {
+                        live_find(&mut self.search, modal, tab, &self.documents);
+                    }
                 }
             }
             KeyCode::Left => {
@@ -1035,13 +1332,24 @@ impl App {
 
         // Modal overlay
         if let Some(ref modal) = self.modal {
-            let search_status = if modal.kind == ModalKind::Find {
-                Some(self.search.status_text())
-            } else {
-                None
-            };
+            let search_status =
+                if modal.kind == ModalKind::Find || modal.kind == ModalKind::FindReplace {
+                    Some(self.search.status_text())
+                } else {
+                    None
+                };
             frame.render_widget(
                 ModalWidget::new(modal, &self.theme).search_status(search_status),
+                editor_area,
+            );
+        }
+
+        if self.command_palette.visible {
+            frame.render_widget(
+                CommandPaletteWidget {
+                    state: &self.command_palette,
+                    theme: &self.theme,
+                },
                 editor_area,
             );
         }
@@ -1053,11 +1361,12 @@ impl App {
             None
         };
         let doc = &self.documents[self.active_tab];
-        frame.render_widget(
-            StatusBar::new(doc, &self.theme)
-                .search_status(search_status)
-                .message(self.status_message.clone()),
-            main_chunks[2],
-        );
+        let mut status = StatusBar::new(doc, &self.theme)
+            .search_status(search_status)
+            .message(self.status_message.clone());
+        if self.documents.len() > 1 {
+            status = status.tab_hint(self.active_tab + 1, self.documents.len());
+        }
+        frame.render_widget(status, main_chunks[2]);
     }
 }

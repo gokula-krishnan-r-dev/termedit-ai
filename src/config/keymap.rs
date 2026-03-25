@@ -46,6 +46,7 @@ pub enum Action {
     ToggleComment,
     Indent,
     Dedent,
+    DuplicateLine,
 
     // === Clipboard ===
     Copy,
@@ -74,6 +75,8 @@ pub enum Action {
     // === Tabs ===
     NextTab,
     PrevTab,
+    /// Switch to tab index 0–8 (Alt+1 … Alt+9).
+    GoToTab(usize),
 
     // === App ===
     Quit,
@@ -117,31 +120,49 @@ pub fn map_key_event(event: KeyEvent) -> Action {
         KeyCode::End if shift => Action::SelectEnd,
         KeyCode::Home => Action::Home,
         KeyCode::End => Action::End,
+        KeyCode::PageUp if ctrl => Action::PrevTab,
+        KeyCode::PageDown if ctrl => Action::NextTab,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
+        KeyCode::F(3) if shift => Action::FindPrev,
+        KeyCode::F(3) => Action::FindNext,
+
+        // Alt+1 … Alt+9 → tabs 0…8
+        KeyCode::Char('1') if alt => Action::GoToTab(0),
+        KeyCode::Char('2') if alt => Action::GoToTab(1),
+        KeyCode::Char('3') if alt => Action::GoToTab(2),
+        KeyCode::Char('4') if alt => Action::GoToTab(3),
+        KeyCode::Char('5') if alt => Action::GoToTab(4),
+        KeyCode::Char('6') if alt => Action::GoToTab(5),
+        KeyCode::Char('7') if alt => Action::GoToTab(6),
+        KeyCode::Char('8') if alt => Action::GoToTab(7),
+        KeyCode::Char('9') if alt => Action::GoToTab(8),
 
         // === Ctrl/Cmd shortcuts ===
+        KeyCode::Char('q') if ctrl && shift => Action::ForceQuit,
         KeyCode::Char('q') if ctrl => Action::Quit,
         KeyCode::Char('s') if (ctrl || super_) && shift => Action::SaveAs,
         KeyCode::Char('s') if ctrl || super_ => Action::Save,
-        KeyCode::Char('z') if ctrl => Action::Undo,
-        KeyCode::Char('y') if ctrl => Action::Redo,
-        KeyCode::Char('c') if ctrl => Action::Copy,
-        KeyCode::Char('x') if ctrl => Action::Cut,
-        KeyCode::Char('v') if ctrl => Action::Paste,
-        KeyCode::Char('a') if ctrl => Action::SelectAll,
-        KeyCode::Char('l') if ctrl => Action::SelectLine,
-        KeyCode::Char('d') if ctrl => Action::DeleteLine,
-        KeyCode::Char('f') if ctrl => Action::Find,
-        KeyCode::Char('h') if ctrl => Action::FindReplace,
-        KeyCode::Char('g') if ctrl => Action::GoToLine,
-        KeyCode::Char('n') if ctrl => Action::NewFile,
-        KeyCode::Char('o') if ctrl => Action::OpenFile,
+        KeyCode::Char('z') if (ctrl || super_) && shift => Action::Redo,
+        KeyCode::Char('z') if ctrl || super_ => Action::Undo,
+        KeyCode::Char('y') if ctrl || super_ => Action::Redo,
+        KeyCode::Char('c') if ctrl || super_ => Action::Copy,
+        KeyCode::Char('x') if ctrl || super_ => Action::Cut,
+        KeyCode::Char('v') if ctrl || super_ => Action::Paste,
+        KeyCode::Char('a') if ctrl || super_ => Action::SelectAll,
+        KeyCode::Char('l') if ctrl || super_ => Action::SelectLine,
+        KeyCode::Char('d') if (ctrl || super_) && shift => Action::DuplicateLine,
+        KeyCode::Char('d') if ctrl || super_ => Action::DeleteLine,
+        KeyCode::Char('f') if ctrl || super_ => Action::Find,
+        KeyCode::Char('h') if ctrl || super_ => Action::FindReplace,
+        KeyCode::Char('g') if ctrl || super_ => Action::GoToLine,
+        KeyCode::Char('n') if ctrl || super_ => Action::NewFile,
+        KeyCode::Char('o') if ctrl || super_ => Action::OpenFile,
         KeyCode::Char('w') if ctrl || super_ => Action::CloseBuffer,
-        KeyCode::Char('b') if ctrl => Action::ToggleFileTree,
-        KeyCode::Char('k') if ctrl => Action::ToggleAiPanel,
-        KeyCode::Char('p') if ctrl => Action::CommandPalette,
-        KeyCode::Char('/') if ctrl => Action::ToggleComment,
+        KeyCode::Char('b') if ctrl || super_ => Action::ToggleFileTree,
+        KeyCode::Char('k') if ctrl || super_ => Action::ToggleAiPanel,
+        KeyCode::Char('p') if ctrl || super_ => Action::CommandPalette,
+        KeyCode::Char('/') if ctrl || super_ => Action::ToggleComment,
         KeyCode::Tab if ctrl && shift => Action::PrevTab,
         KeyCode::Tab if ctrl => Action::NextTab,
         KeyCode::Tab if shift => Action::Dedent,
@@ -199,5 +220,53 @@ mod tests {
     fn test_alt_up() {
         let event = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
         assert_eq!(map_key_event(event), Action::MoveLineUp);
+    }
+
+    #[test]
+    fn test_f3_find_next_prev() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            Action::FindNext
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT)),
+            Action::FindPrev
+        );
+    }
+
+    #[test]
+    fn test_ctrl_page_tab_cycle() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL)),
+            Action::PrevTab
+        );
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL)),
+            Action::NextTab
+        );
+    }
+
+    #[test]
+    fn test_alt_digit_tab() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT)),
+            Action::GoToTab(1)
+        );
+    }
+
+    #[test]
+    fn test_ctrl_shift_q_force_quit() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL | KeyModifiers::SHIFT)),
+            Action::ForceQuit
+        );
+    }
+
+    #[test]
+    fn test_cmd_z_undo() {
+        assert_eq!(
+            map_key_event(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::SUPER)),
+            Action::Undo
+        );
     }
 }

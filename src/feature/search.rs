@@ -79,12 +79,11 @@ impl Search {
             return &self.matches;
         }
 
-        let text = rope.to_string();
-
         if config.is_regex {
+            let text = rope.to_string();
             self.find_regex(&config, &text);
         } else {
-            self.find_literal(&config, &text);
+            self.find_literal_rope(&config, rope);
         }
 
         if !self.matches.is_empty() {
@@ -95,7 +94,68 @@ impl Search {
         &self.matches
     }
 
-    /// Find literal text matches.
+    /// Find literal matches by scanning the rope (no full-document `String` copy).
+    fn find_literal_rope(&mut self, config: &SearchConfig, rope: &Rope) {
+        let pattern = &config.pattern;
+        let pat_chars: Vec<char> = pattern.chars().collect();
+        let plen = pat_chars.len();
+        if plen == 0 {
+            return;
+        }
+        let n = rope.len_chars();
+        if plen > n {
+            return;
+        }
+
+        let pat_lower: Option<Vec<String>> = if config.case_sensitive {
+            None
+        } else {
+            Some(
+                pat_chars
+                    .iter()
+                    .map(|c| c.to_lowercase().to_string())
+                    .collect(),
+            )
+        };
+
+        'outer: for i in 0..=n - plen {
+            for j in 0..plen {
+                let rc = rope.char(i + j);
+                let ok = if config.case_sensitive {
+                    rc == pat_chars[j]
+                } else {
+                    rc.to_lowercase().to_string() == pat_lower.as_ref().unwrap()[j]
+                };
+                if !ok {
+                    continue 'outer;
+                }
+            }
+            if config.whole_word && !self.is_whole_word_rope(rope, i, plen) {
+                continue;
+            }
+            let matched: String = (0..plen).map(|k| rope.char(i + k)).collect();
+            self.matches.push(SearchMatch {
+                start: i,
+                end: i + plen,
+                text: matched,
+            });
+        }
+    }
+
+    fn is_whole_word_rope(&self, rope: &Rope, char_start: usize, pat_len_chars: usize) -> bool {
+        let before_ok = char_start == 0 || {
+            let c = rope.char(char_start - 1);
+            !c.is_alphanumeric() && c != '_'
+        };
+        let end = char_start + pat_len_chars;
+        let after_ok = end >= rope.len_chars() || {
+            let c = rope.char(end);
+            !c.is_alphanumeric() && c != '_'
+        };
+        before_ok && after_ok
+    }
+
+    /// Find literal text matches (used by tests and byte-oriented callers).
     fn find_literal(&mut self, config: &SearchConfig, text: &str) {
         let pattern = &config.pattern;
         let search_text;
