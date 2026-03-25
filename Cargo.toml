@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A modern, nano-style terminal editor with session restore, AI ghost text, and professional shortcuts"
 license = "MIT"
+repository = "https://github.com/gokula-krishnan-r-dev/termedit-ai"
 
 [dependencies]
 # TUI framework

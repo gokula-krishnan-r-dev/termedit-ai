@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            binary: termedit
+            archive: termedit-linux-x86_64.tar.gz
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            binary: termedit
+            archive: termedit-linux-arm64.tar.gz
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            binary: termedit
+            archive: termedit-macos-x86_64.tar.gz
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: termedit
+            archive: termedit-macos-arm64.tar.gz
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: termedit.exe
+            archive: termedit-windows-x86_64.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install cross (ARM builds)
+        if: contains(matrix.target, 'aarch64')
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (standard)
+        if: "!contains(matrix.target, 'aarch64-unknown-linux')"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross for ARM Linux)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} .
+          tar czf ${{ matrix.archive }} ${{ matrix.binary }}
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} .
+          Compress-Archive ${{ matrix.binary }} ${{ matrix.archive }}
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ matrix.archive }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
