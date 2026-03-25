@@ -35,3 +35,4 @@ cargo build --release
 
 Optimized for size and speed (LTO, strip, single codegen unit in release).
 # termedit-ai
+# termedit-ai
